@@ -84,27 +84,46 @@ def _make_sequences(X: np.ndarray, y: np.ndarray, seq_len: int):
 class DataProcessor:
     """Data Processing class."""
 
-    def __init__(self, path_folder: str, X: pd.DataFrame = None):
+    def __init__(self, path_folder: str, X: pd.DataFrame = None, drop_columns: list = ["site_name"]):
         self.path = path_folder
         self.time_column = "delivery_time"
         self.predict_column = "production_normalized"
+        self.drop_columns = drop_columns
         self.df = self.open_data() if X is None else X
 
     def open_data(self) -> pd.DataFrame:
-        """Open data from path."""
-        df = pd.DataFrame()
-        for file in Path(self.path).glob("*.parquet"):
-            if file.name.startswith("dataset_2"):
+        """Open and merge data while fixing type mismatches"""
+        main_df = None
+        files = sorted(Path(self.path).glob("*.parquet"))
+        
+        for file in files:
+            if "dataset_2" in file.name:
                 continue
-            df = pd.concat([df, pd.read_parquet(file)], ignore_index=True)
-        return df
+                
+            current_df = pd.read_parquet(file)
+            if "delivery_time" in current_df.columns:
+                current_df["delivery_time"] = pd.to_datetime(current_df["delivery_time"], utc=True)
+            if main_df is None:
+                main_df = current_df
+            else:
+                main_df["delivery_time"] = pd.to_datetime(main_df["delivery_time"], utc=True)
+                main_df = pd.merge(
+                    main_df, 
+                    current_df, 
+                    on=["site_name", "delivery_time"], 
+                    how="inner"
+                )
+        return main_df if main_df is not None else pd.DataFrame()
 
     def prepocess_data(self) -> pd.DataFrame:
-        pass
+        return self.df
 
-    def engineer_features(self) -> pd.DataFrame:
+    def engineer_features(self, df: pd.DataFrame, mask_columns: list = None) -> pd.DataFrame:
         """Engineer features for the model."""
-        df = self.df.copy()
+        df = df.copy()
+        df = df.dropna(subset=[self.time_column, "production", "installed_capacity"])
+        df = df[df["installed_capacity"] != 0]
+
         df[self.time_column] = pd.to_datetime(df[self.time_column])
         df["hour"]        = df[self.time_column].dt.hour
         df["day_of_week"] = df[self.time_column].dt.dayofweek
@@ -125,21 +144,41 @@ class DataProcessor:
             df[f"{col}_cubed"]   = df[col] ** 3
         df["wind_speed_ratio"] = df["wind_speed_100m"] / (df["wind_speed_10m"] + 1e-8)
 
-        # Lag / rolling features — be careful of data leakage
-        df["production_lag1"]              = df["production_normalized"].shift(1)
-        df["production_lag24"]             = df["production_normalized"].shift(24)
-        df["production_rolling_mean_24"]   = df["production_normalized"].rolling(24).mean()
-        df["production_rolling_std_24"]    = df["production_normalized"].rolling(24).std()
-        df["production_rolling_mean_168"]  = df["production_normalized"].rolling(168).mean()
-        df["production_rolling_std_168"]   = df["production_normalized"].rolling(168).std()
+        df = df.sort_values(["site_name", self.time_column])
+        df['production_lag1'] = df.groupby('site_name')[self.predict_column].shift(1)
+        df['production_lag24'] = df.groupby('site_name')[self.predict_column].shift(24)
+        df['production_rolling_mean_24'] = (
+            df.groupby('site_name')[self.predict_column]
+            .transform(lambda x: x.rolling(window=24).mean())
+        )
+        df['production_rolling_std_24'] = (
+            df.groupby('site_name')[self.predict_column]
+            .transform(lambda x: x.rolling(window=24).std())
+        )
+        df['production_rolling_mean_168'] = (
+            df.groupby('site_name')[self.predict_column]
+            .transform(lambda x: x.rolling(window=168).mean())
+        )
+        df['production_rolling_std_168'] = (
+            df.groupby('site_name')[self.predict_column]
+            .transform(lambda x: x.rolling(window=168).std())
+        )
+
+        if mask_columns:
+            final_mask = np.logical_and.reduce(mask_columns)
+            df = df[final_mask]
+
+        df.drop(columns=self.drop_columns, inplace=True, errors="ignore")
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.dropna(subset=[self.time_column, self.predict_column])
 
         return df
     
     def run(self) -> pd.DataFrame:
         """Run the full processing pipeline."""
-        self.prepocess_data()
-        self.engineer_features()
-        return self.df.copy()
+        df = self.prepocess_data()
+        df = self.engineer_features(df)
+        return df
 
 
 # ---------------------------------------------------------------------------
@@ -204,15 +243,21 @@ class ForecastModel:
 
     def evaluate(self, df: pd.DataFrame = None) -> dict:
         """Return stored cross-validation metrics."""
-        prediction = self.predict(df.drop(columns=[self.time_column, self.predict_column])) if df is not None else None
-        error = mean_absolute_error(df[self.predict_column], prediction) if prediction is not None else None
-        return error
+        results = dict(self.evaluation_results)
+        if df is not None:
+            processed = DataProcessor(path_folder="", X=df).run()
+            prediction = self.predict(df)
+            y_true = processed[self.predict_column].to_numpy()
+            if len(prediction) != len(y_true):
+                y_true = y_true[-len(prediction):]
+            results["eval_mae"] = float(mean_absolute_error(y_true, prediction))
+        return results
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         """Predict on a new DataFrame (raw, before feature engineering)."""
         if self.model is None:
             raise ValueError("Model has not been trained yet.")
-        processed = DataProcessor(path_folder="", X=df).engineer_features()
+        processed = DataProcessor(path_folder="", X=df).run()
         dispatch = {
             "random_forest": self._predict_sklearn,
             "xgboost":       self._predict_sklearn,
@@ -264,7 +309,7 @@ class ForecastModel:
         tscv = TimeSeriesSplit(n_splits=self.n_splits)
         maes = []
         for train_idx, val_idx in tscv.split(X):
-            X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]   # ← fixed shadowing
+            X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
             fold_model = clone(self.model)
             fold_model.fit(X_tr, y_tr)
@@ -274,7 +319,6 @@ class ForecastModel:
         self.evaluation_results = {"cv_mae": cv_mae, "cv_mae_std": float(np.std(maes))}
         print(f"[{self.model_type}] CV MAE: {cv_mae:.4f} ± {np.std(maes):.4f}")
 
-        # Final fit on the complete dataset
         self.model.fit(X, y)
 
     def _predict_sklearn(self, df: pd.DataFrame) -> np.ndarray:
@@ -288,7 +332,13 @@ class ForecastModel:
     def _train_sarimax(self, df: pd.DataFrame) -> None:
         from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-        series = df.set_index(self.time_column)[self.predict_column].asfreq("h")
+        series = (
+            df.set_index(self.time_column)[self.predict_column]
+            .sort_index()
+        )
+        if series.index.has_duplicates:
+            series = series.groupby(level=0).mean()
+        series = series.asfreq("h").interpolate(method="time").ffill().bfill()
 
         tscv  = TimeSeriesSplit(n_splits=self.n_splits)
         idx   = np.arange(len(series))
@@ -314,7 +364,6 @@ class ForecastModel:
         self.evaluation_results = {"cv_mae": cv_mae}
         print(f"[sarimax] CV MAE: {cv_mae:.4f}")
 
-        # Final fit on full series
         self.model = SARIMAX(
             series,
             order=self.SARIMAX_ORDER,
@@ -369,27 +418,30 @@ class ForecastModel:
         params  = self._get_dl_params()
         seq_len = params["seq_len"]
 
-        # ---- prepare raw arrays -----------------------------------------
         feat_cols = [c for c in df.columns if c not in (self.time_column, self.predict_column)]
         df_clean  = df.dropna(subset=feat_cols + [self.predict_column])
 
         X_raw = df_clean[feat_cols].values.astype(np.float32)
         y_raw = df_clean[self.predict_column].values.astype(np.float32)
 
-        # ---- scalers (fit on train, reused at inference) -----------------
-        self.scaler_X = StandardScaler().fit(X_raw)
-        self.scaler_y = StandardScaler().fit(y_raw.reshape(-1, 1))
-        X_sc = self.scaler_X.transform(X_raw)
-        y_sc = self.scaler_y.transform(y_raw.reshape(-1, 1)).ravel()
-
-        # ---- time-series CV ----------------------------------------------
         tscv = TimeSeriesSplit(n_splits=self.n_splits)
         maes = []
-        idx  = np.arange(len(X_sc))
+        idx  = np.arange(len(X_raw))
 
         for fold, (train_idx, val_idx) in enumerate(tscv.split(idx)):
-            X_tr, y_tr = _make_sequences(X_sc[train_idx], y_sc[train_idx], seq_len)
-            X_val_s, y_val_s = _make_sequences(X_sc[val_idx], y_sc[val_idx], seq_len)
+            X_tr_raw, y_tr_raw = X_raw[train_idx], y_raw[train_idx]
+            X_val_raw, y_val_raw = X_raw[val_idx], y_raw[val_idx]
+
+            scaler_X_fold = StandardScaler().fit(X_tr_raw)
+            scaler_y_fold = StandardScaler().fit(y_tr_raw.reshape(-1, 1))
+
+            X_tr_sc = scaler_X_fold.transform(X_tr_raw)
+            y_tr_sc = scaler_y_fold.transform(y_tr_raw.reshape(-1, 1)).ravel()
+            X_val_sc = scaler_X_fold.transform(X_val_raw)
+            y_val_sc = scaler_y_fold.transform(y_val_raw.reshape(-1, 1)).ravel()
+
+            X_tr, y_tr = _make_sequences(X_tr_sc, y_tr_sc, seq_len)
+            X_val_s, y_val_s = _make_sequences(X_val_sc, y_val_sc, seq_len)
             if len(X_tr) == 0 or len(X_val_s) == 0:
                 continue
 
@@ -410,8 +462,8 @@ class ForecastModel:
             net.eval()
             with torch.no_grad():
                 preds_sc = net(torch.from_numpy(X_val_s)).numpy()
-            preds = self.scaler_y.inverse_transform(preds_sc.reshape(-1, 1)).ravel()
-            truth = self.scaler_y.inverse_transform(y_val_s.reshape(-1, 1)).ravel()
+            preds = scaler_y_fold.inverse_transform(preds_sc.reshape(-1, 1)).ravel()
+            truth = scaler_y_fold.inverse_transform(y_val_s.reshape(-1, 1)).ravel()
             maes.append(mean_absolute_error(truth, preds))
             print(f"  [{self.model_type}] fold {fold+1} MAE: {maes[-1]:.4f}")
 
@@ -419,7 +471,11 @@ class ForecastModel:
         self.evaluation_results = {"cv_mae": cv_mae, "cv_mae_std": float(np.std(maes))}
         print(f"[{self.model_type}] CV MAE: {cv_mae:.4f}")
 
-        # ---- final training on full data ---------------------------------
+        self.scaler_X = StandardScaler().fit(X_raw)
+        self.scaler_y = StandardScaler().fit(y_raw.reshape(-1, 1))
+        X_sc = self.scaler_X.transform(X_raw)
+        y_sc = self.scaler_y.transform(y_raw.reshape(-1, 1)).ravel()
+
         X_full, y_full = _make_sequences(X_sc, y_sc, seq_len)
         self.model = self._build_dl_model(X_full.shape[2])
         opt     = torch.optim.Adam(self.model.parameters(), lr=self.DL_LR)
