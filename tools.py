@@ -116,8 +116,21 @@ class DataProcessor:
                 )
         return main_df if main_df is not None else pd.DataFrame()
 
-    def prepocess_data(self) -> pd.DataFrame:
-        return self.df
+    def prepocess_data(self,
+                    N: int = 5,
+                    window: str = "24h",
+                    tolerance: float = 0.01,
+                    low_thresh: float = 0.1,
+                    high_thresh: float = 0.9) -> pd.DataFrame:
+
+        df = self.df.copy()
+
+        df["production_normalized"] = df["production"] / df["installed_capacity"]
+
+        df = compute_plateau(df=df, N=N, window=window, tolerance=tolerance,
+                            low_thresh=low_thresh, high_thresh=high_thresh)
+        self.df = df
+        return df
 
     def engineer_features(self, df: pd.DataFrame, mask_columns: list = None) -> pd.DataFrame:
         """Engineer features for the model."""
@@ -181,6 +194,41 @@ class DataProcessor:
         df = self.engineer_features(df)
         return df
 
+
+def compute_plateau(df: pd.DataFrame, N: int = 5, window: str = "24h", tolerance: float = 0.01, low_thresh: float = 0.1, high_thresh: float = 0.9):
+
+    def count_similar_in_window(series, window, tol):
+        # Déduire le pas temporel
+        freq = series.index.to_series().diff().median()
+        half_window = pd.Timedelta(window) / 2
+        n_points = int(half_window / freq)  # nb de points de chaque côté
+
+        values = series.values
+        counts = np.array([
+            np.sum(np.abs(values[max(0, i-n_points):i+n_points+1] - v) < tol)
+            for i, v in enumerate(values)
+        ])
+        return pd.Series(counts, index=series.index)
+
+    results = []
+    for site, df_site in df.groupby("site_name"):
+        df_site = df_site.sort_values("delivery_time").copy()
+        df_site = df_site.set_index("delivery_time")
+
+        p_max = df_site["production_normalized"].max()
+        p_low = p_max * low_thresh
+        p_high = p_max * high_thresh
+
+        df_site["similar_count"] = count_similar_in_window(
+            df_site["production_normalized"], window, tolerance)
+        in_zone = (df_site["production_normalized"] >= p_low) & (
+            df_site["production_normalized"] <= p_high)
+        df_site["is_not_plateau"] = ~(
+            (df_site["similar_count"] >= N) & in_zone)
+
+        results.append(df_site.reset_index())
+
+    return pd.concat(results, ignore_index=True)
 
 # ---------------------------------------------------------------------------
 # ForecastModel
@@ -495,15 +543,15 @@ class ForecastModel:
                 epoch_loss += l.item()
             if (epoch + 1) % 10 == 0:
                 print(f"  [{self.model_type}] epoch {epoch+1}/{params['epochs']} "
-                      f"loss: {epoch_loss/len(loader):.6f}")
+                    f"loss: {epoch_loss/len(loader):.6f}")
 
     def _predict_deep(self, df: pd.DataFrame) -> np.ndarray:
         import torch
 
         seq_len   = (self.LSTM_SEQ_LEN if self.model_type == "lstm"
-                     else self.TRANSFORMER_SEQ_LEN)
+                    else self.TRANSFORMER_SEQ_LEN)
         feat_cols = [c for c in df.columns
-                     if c not in (self.time_column, self.predict_column)]
+                    if c not in (self.time_column, self.predict_column)]
 
         X_raw = df[feat_cols].values.astype(np.float32)
         X_sc  = self.scaler_X.transform(X_raw)
