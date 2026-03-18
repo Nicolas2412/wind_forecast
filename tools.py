@@ -92,15 +92,29 @@ class DataProcessor:
 
     def open_data(self) -> pd.DataFrame:
         """Open data from path."""
-        df = pd.DataFrame()
-        for file in Path(self.path).glob("*.parquet"):
-            if file.name.startswith("dataset_2"):
-                continue
-            df = pd.concat([df, pd.read_parquet(file)], ignore_index=True)
+        df1 = pd.read_parquet(self.path + 'dataset_1.parquet')
+        df3 = pd.read_parquet(self.path + 'dataset_3.parquet')
+        df1["delivery_time"] = pd.to_datetime(df1["delivery_time"], utc=True)
+        df3["delivery_time"] = pd.to_datetime(df3["delivery_time"], utc=True)
+        df = df1.merge(df3, on=["site_name", "delivery_time"], how="inner")
         return df
 
-    def prepocess_data(self) -> pd.DataFrame:
-        pass
+    def prepocess_data(self,
+                    N: int = 5,
+                    window: str = "24h",
+                    tolerance: float = 0.01,
+                    low_thresh: float = 0.1,
+                    high_thresh: float = 0.9) -> pd.DataFrame:
+        
+
+        df = self.df.copy()
+        
+        df["production_normalized"] = df["production"] / df["installed_capacity"]
+        
+        df = compute_plateau(df=df, N=N, window=window, tolerance=tolerance,
+                            low_thresh=low_thresh, high_thresh=high_thresh)
+        
+        return df
 
     def engineer_features(self) -> pd.DataFrame:
         """Engineer features for the model."""
@@ -140,6 +154,41 @@ class DataProcessor:
         self.prepocess_data()
         self.engineer_features()
         return self.df.copy()
+
+
+def compute_plateau(df: pd.DataFrame, N:int=5, window:str="24h", tolerance:float=0.01, low_thresh:float=0.1, high_thresh:float=0.9):
+
+    def count_similar_in_window(series, window, tol):
+        # Déduire le pas temporel
+        freq = series.index.to_series().diff().median()
+        half_window = pd.Timedelta(window) / 2
+        n_points = int(half_window / freq)  # nb de points de chaque côté
+
+        values = series.values
+        counts = np.array([
+            np.sum(np.abs(values[max(0, i-n_points):i+n_points+1] - v) < tol)
+            for i, v in enumerate(values)
+        ])
+        return pd.Series(counts, index=series.index)
+
+    results = []
+    for site, df_site in df.groupby("site_name"):
+        df_site = df_site.sort_values("delivery_time").copy()
+        df_site = df_site.set_index("delivery_time")
+
+        p_max = df_site["production_normalized"].max()
+        p_low = p_max * low_thresh
+        p_high = p_max * high_thresh
+
+        df_site["similar_count"] = count_similar_in_window(
+            df_site["production_normalized"], window, tolerance)
+        in_zone = (df_site["production_normalized"] >= p_low) & (
+            df_site["production_normalized"] <= p_high)
+        df_site["is_not_plateau"] = ~((df_site["similar_count"] >= N) & in_zone)
+
+        results.append(df_site.reset_index())
+
+    return pd.concat(results, ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
