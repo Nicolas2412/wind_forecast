@@ -113,7 +113,7 @@ class DataProcessor:
         
         df = compute_plateau(df=df, N=N, window=window, tolerance=tolerance,
                             low_thresh=low_thresh, high_thresh=high_thresh)
-        
+        self.df = df
         return df
 
     def engineer_features(self) -> pd.DataFrame:
@@ -147,6 +147,7 @@ class DataProcessor:
         df["production_rolling_mean_168"]  = df["production_normalized"].rolling(168).mean()
         df["production_rolling_std_168"]   = df["production_normalized"].rolling(168).std()
 
+        self.df = df
         return df
     
     def run(self) -> pd.DataFrame:
