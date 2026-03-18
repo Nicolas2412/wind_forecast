@@ -7,6 +7,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import clone
 from sklearn.preprocessing import StandardScaler
 
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # PyTorch helpers (imported lazily inside the classes that need them)
@@ -472,52 +473,52 @@ class ForecastModel:
         X_raw = df_clean[feat_cols].values.astype(np.float32)
         y_raw = df_clean[self.predict_column].values.astype(np.float32)
 
-        tscv = TimeSeriesSplit(n_splits=self.n_splits)
-        maes = []
-        idx  = np.arange(len(X_raw))
+        # tscv = TimeSeriesSplit(n_splits=self.n_splits)
+        # maes = []
+        # idx  = np.arange(len(X_raw))
 
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(idx)):
-            X_tr_raw, y_tr_raw = X_raw[train_idx], y_raw[train_idx]
-            X_val_raw, y_val_raw = X_raw[val_idx], y_raw[val_idx]
+        # for fold, (train_idx, val_idx) in enumerate(tscv.split(idx)):
+        #     X_tr_raw, y_tr_raw = X_raw[train_idx], y_raw[train_idx]
+        #     X_val_raw, y_val_raw = X_raw[val_idx], y_raw[val_idx]
 
-            scaler_X_fold = StandardScaler().fit(X_tr_raw)
-            scaler_y_fold = StandardScaler().fit(y_tr_raw.reshape(-1, 1))
+        #     scaler_X_fold = StandardScaler().fit(X_tr_raw)
+        #     scaler_y_fold = StandardScaler().fit(y_tr_raw.reshape(-1, 1))
 
-            X_tr_sc = scaler_X_fold.transform(X_tr_raw)
-            y_tr_sc = scaler_y_fold.transform(y_tr_raw.reshape(-1, 1)).ravel()
-            X_val_sc = scaler_X_fold.transform(X_val_raw)
-            y_val_sc = scaler_y_fold.transform(y_val_raw.reshape(-1, 1)).ravel()
+        #     X_tr_sc = scaler_X_fold.transform(X_tr_raw)
+        #     y_tr_sc = scaler_y_fold.transform(y_tr_raw.reshape(-1, 1)).ravel()
+        #     X_val_sc = scaler_X_fold.transform(X_val_raw)
+        #     y_val_sc = scaler_y_fold.transform(y_val_raw.reshape(-1, 1)).ravel()
 
-            X_tr, y_tr = _make_sequences(X_tr_sc, y_tr_sc, seq_len)
-            X_val_s, y_val_s = _make_sequences(X_val_sc, y_val_sc, seq_len)
-            if len(X_tr) == 0 or len(X_val_s) == 0:
-                continue
+        #     X_tr, y_tr = _make_sequences(X_tr_sc, y_tr_sc, seq_len)
+        #     X_val_s, y_val_s = _make_sequences(X_val_sc, y_val_sc, seq_len)
+        #     if len(X_tr) == 0 or len(X_val_s) == 0:
+        #         continue
 
-            net = self._build_dl_model(X_tr.shape[2])
-            opt = torch.optim.Adam(net.parameters(), lr=self.DL_LR)
-            loss_fn = nn.MSELoss()
-            loader  = DataLoader(
-                TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr)),
-                batch_size=params["batch"], shuffle=False,
-            )
-            net.train()
-            for _ in range(params["epochs"]):
-                for xb, yb in loader:
-                    opt.zero_grad()
-                    loss_fn(net(xb), yb).backward()
-                    opt.step()
+        #     net = self._build_dl_model(X_tr.shape[2])
+        #     opt = torch.optim.Adam(net.parameters(), lr=self.DL_LR)
+        #     loss_fn = nn.MSELoss()
+        #     loader  = DataLoader(
+        #         TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr)),
+        #         batch_size=params["batch"], shuffle=False,
+        #     )
+        #     net.train()
+        #     for _ in range(params["epochs"]):
+        #         for xb, yb in loader:
+        #             opt.zero_grad()
+        #             loss_fn(net(xb), yb).backward()
+        #             opt.step()
 
-            net.eval()
-            with torch.no_grad():
-                preds_sc = net(torch.from_numpy(X_val_s)).numpy()
-            preds = scaler_y_fold.inverse_transform(preds_sc.reshape(-1, 1)).ravel()
-            truth = scaler_y_fold.inverse_transform(y_val_s.reshape(-1, 1)).ravel()
-            maes.append(mean_absolute_error(truth, preds))
-            print(f"  [{self.model_type}] fold {fold+1} MAE: {maes[-1]:.4f}")
+        #     net.eval()
+        #     with torch.no_grad():
+        #         preds_sc = net(torch.from_numpy(X_val_s)).numpy()
+        #     preds = scaler_y_fold.inverse_transform(preds_sc.reshape(-1, 1)).ravel()
+        #     truth = scaler_y_fold.inverse_transform(y_val_s.reshape(-1, 1)).ravel()
+        #     maes.append(mean_absolute_error(truth, preds))
+        #     print(f"  [{self.model_type}] fold {fold+1} MAE: {maes[-1]:.4f}")
 
-        cv_mae = float(np.mean(maes)) if maes else float("nan")
-        self.evaluation_results = {"cv_mae": cv_mae, "cv_mae_std": float(np.std(maes))}
-        print(f"[{self.model_type}] CV MAE: {cv_mae:.4f}")
+        # cv_mae = float(np.mean(maes)) if maes else float("nan")
+        # self.evaluation_results = {"cv_mae": cv_mae, "cv_mae_std": float(np.std(maes))}
+        # print(f"[{self.model_type}] CV MAE: {cv_mae:.4f}")
 
         self.scaler_X = StandardScaler().fit(X_raw)
         self.scaler_y = StandardScaler().fit(y_raw.reshape(-1, 1))
@@ -533,7 +534,7 @@ class ForecastModel:
             batch_size=params["batch"], shuffle=False,
         )
         self.model.train()
-        for epoch in range(params["epochs"]):
+        for epoch in tqdm(range(params["epochs"])):
             epoch_loss = 0.0
             for xb, yb in loader:
                 opt.zero_grad()
