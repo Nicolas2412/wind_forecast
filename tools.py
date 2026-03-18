@@ -7,6 +7,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import clone
 from sklearn.preprocessing import StandardScaler
 
+VALID_MODELS = ["random_forest", "xgboost", "lightgbm", "sarimax", "lstm", "transformer"]
 
 # ---------------------------------------------------------------------------
 # PyTorch helpers (imported lazily inside the classes that need them)
@@ -209,8 +210,6 @@ class ForecastModel:
     DL_LR               = 1e-3
     # -----------------------------------------------------------------------
 
-    VALID_MODELS = ["random_forest", "xgboost", "lightgbm", "sarimax", "lstm", "transformer"]
-
     def __init__(self, model_type: str = "random_forest"):
         self.time_column    = "delivery_time"
         self.predict_column = "production_normalized"
@@ -245,9 +244,8 @@ class ForecastModel:
         """Return stored cross-validation metrics."""
         results = dict(self.evaluation_results)
         if df is not None:
-            processed = DataProcessor(path_folder="", X=df).run()
             prediction = self.predict(df)
-            y_true = processed[self.predict_column].to_numpy()
+            y_true = df[self.predict_column].to_numpy()
             if len(prediction) != len(y_true):
                 y_true = y_true[-len(prediction):]
             results["eval_mae"] = float(mean_absolute_error(y_true, prediction))
@@ -257,7 +255,8 @@ class ForecastModel:
         """Predict on a new DataFrame (raw, before feature engineering)."""
         if self.model is None:
             raise ValueError("Model has not been trained yet.")
-        processed = DataProcessor(path_folder="", X=df).run()
+        if 'production_lag1' not in df.columns:
+            df = DataProcessor(path_folder="", X=df).run()
         dispatch = {
             "random_forest": self._predict_sklearn,
             "xgboost":       self._predict_sklearn,
@@ -266,13 +265,14 @@ class ForecastModel:
             "lstm":          self._predict_deep,
             "transformer":   self._predict_deep,
         }
-        return dispatch[self.model_type](processed)
+        return dispatch[self.model_type](df)
 
     # ------------------------------------------------------------------
     # Model builders
     # ------------------------------------------------------------------
 
     def _validate(self, model_type: str) -> str:
+        self.VALID_MODELS = VALID_MODELS
         if model_type not in self.VALID_MODELS:
             raise ValueError(f"Invalid model type. Choose from {self.VALID_MODELS}")
         return model_type
