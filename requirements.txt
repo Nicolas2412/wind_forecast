@@ -1,4 +1,11 @@
+numpy
 pandas
+scikit-learn
 pyarrow
+fastparquet
+xgboost
+lightgbm
+statsmodels
+torch
 matplotlib
 seaborn
