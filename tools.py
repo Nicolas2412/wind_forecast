@@ -8,6 +8,9 @@ from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import clone
 from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+
+DEFAULT_TEST_SIZE = 0.2
 
 SUPPORTED_MODELS = ["random_forest", "xgboost", "lightgbm", "sarimax", "lstm", "transformer"]
 
@@ -264,24 +267,24 @@ class DataProcessor:
         df["wind_speed_ratio"] = df["wind_speed_100m"] / (df["wind_speed_10m"] + 1e-8)
 
         df = df.sort_values(["site_name", self.time_column])
-        df['production_lag1'] = df.groupby('site_name')[self.predict_column].shift(1)
-        df['production_lag24'] = df.groupby('site_name')[self.predict_column].shift(24)
-        df['production_rolling_mean_24'] = (
-            df.groupby('site_name')[self.predict_column]
-            .transform(lambda x: x.rolling(window=24).mean())
-        )
-        df['production_rolling_std_24'] = (
-            df.groupby('site_name')[self.predict_column]
-            .transform(lambda x: x.rolling(window=24).std())
-        )
-        df['production_rolling_mean_168'] = (
-            df.groupby('site_name')[self.predict_column]
-            .transform(lambda x: x.rolling(window=168).mean())
-        )
-        df['production_rolling_std_168'] = (
-            df.groupby('site_name')[self.predict_column]
-            .transform(lambda x: x.rolling(window=168).std())
-        )
+        # df['production_lag1'] = df.groupby('site_name')[self.predict_column].shift(1)
+        # df['production_lag24'] = df.groupby('site_name')[self.predict_column].shift(24)
+        # df['production_rolling_mean_24'] = (
+        #     df.groupby('site_name')[self.predict_column]
+        #     .transform(lambda x: x.rolling(window=24).mean())
+        # )
+        # df['production_rolling_std_24'] = (
+        #     df.groupby('site_name')[self.predict_column]
+        #     .transform(lambda x: x.rolling(window=24).std())
+        # )
+        # df['production_rolling_mean_168'] = (
+        #     df.groupby('site_name')[self.predict_column]
+        #     .transform(lambda x: x.rolling(window=168).mean())
+        # )
+        # df['production_rolling_std_168'] = (
+        #     df.groupby('site_name')[self.predict_column]
+        #     .transform(lambda x: x.rolling(window=168).std())
+        # )
 
         if mask_columns:
             final_mask = np.logical_and.reduce(mask_columns)
@@ -309,7 +312,6 @@ class DataProcessor:
         # 4. On filtre les LIGNES avec le masque ET les COLONNES avec cols_to_keep
         df_final = df.loc[mask, cols_to_keep]
 
-        print(df_final.columns)
         return df_final
 
 def compute_plateau(df: pd.DataFrame, N: int = 5, window: str = "24h", tolerance: float = 0.01, low_thresh: float = 0.1, high_thresh: float = 0.9):
@@ -357,7 +359,7 @@ class ForecastModel:
         random_forest | xgboost | lightgbm | sarimax | lstm | transformer
     """
 
-    def __init__(self, model_type: str = DEFAULT_MODEL_TYPE):
+    def __init__(self, model_type: str = DEFAULT_MODEL_TYPE, savepath:str = None):
         self.time_column    = "delivery_time"
         self.predict_column = "production_normalized"
         self.n_splits       = 5
