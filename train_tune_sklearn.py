@@ -179,7 +179,7 @@ def prepare_Xy(
 ):
     """Renvoie (X, y) en supprimant les colonnes non-features."""
     drop = [c for c in [time_col, target, "site_name"] if c in df.columns]
-    X = df.drop(columns=drop).fillna(0)
+    X = df.drop(columns=drop)
     y = df[target]
     return X, y
 
