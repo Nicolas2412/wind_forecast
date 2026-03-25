@@ -1,13 +1,111 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from copy import deepcopy
 
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import clone
 from sklearn.preprocessing import StandardScaler
 
-VALID_MODELS = ["random_forest", "xgboost", "lightgbm", "sarimax", "lstm", "transformer"]
+SUPPORTED_MODELS = ["random_forest", "xgboost", "lightgbm", "sarimax", "lstm", "transformer"]
+
+DEFAULT_MODEL_PARAMS = {
+    "random_forest": {
+        "n_estimators": 200,
+        "random_state": 42,
+        "n_jobs": -1,
+    },
+    "xgboost": {
+        "n_estimators": 200,
+        "random_state": 42,
+        "n_jobs": -1,
+        "tree_method": "hist",
+    },
+    "lightgbm": {
+        "n_estimators": 200,
+        "random_state": 42,
+        "n_jobs": -1,
+        "verbose": -1,
+    },
+    "sarimax": {
+        "order": [1, 1, 1],
+        "seasonal_order": [1, 1, 1, 24],
+        "enforce_stationarity": False,
+        "enforce_invertibility": False,
+    },
+    "lstm": {
+        "seq_len": 48,
+        "hidden_size": 128,
+        "num_layers": 2,
+        "dropout": 0.2,
+        "epochs": 30,
+        "batch_size": 256,
+        "learning_rate": 1e-3,
+    },
+    "transformer": {
+        "seq_len": 48,
+        "d_model": 64,
+        "nhead": 4,
+        "num_layers": 2,
+        "dropout": 0.1,
+        "epochs": 30,
+        "batch_size": 256,
+        "learning_rate": 1e-3,
+    },
+}
+
+
+def _load_config(config_path: str = "config.yaml") -> dict:
+    config_file = Path(config_path)
+    if not config_file.is_absolute():
+        config_file = Path(__file__).resolve().parent / config_file
+    if not config_file.exists():
+        return {
+            "valid_models": SUPPORTED_MODELS,
+            "model_params": deepcopy(DEFAULT_MODEL_PARAMS),
+        }
+
+    try:
+        import yaml
+    except ImportError:
+        return {
+            "valid_models": SUPPORTED_MODELS,
+            "model_params": deepcopy(DEFAULT_MODEL_PARAMS),
+        }
+
+    try:
+        with config_file.open("r", encoding="utf-8") as file:
+            raw = yaml.safe_load(file) or {}
+    except Exception:
+        raw = {}
+
+    config_valid_models = raw.get("valid_models", SUPPORTED_MODELS)
+    valid_models = [
+        model_name
+        for model_name in config_valid_models
+        if model_name in SUPPORTED_MODELS
+    ]
+    if not valid_models:
+        valid_models = list(SUPPORTED_MODELS)
+
+    model_params = deepcopy(DEFAULT_MODEL_PARAMS)
+    loaded_model_params = raw.get("model_params", {})
+    if isinstance(loaded_model_params, dict):
+        for model_name, params in loaded_model_params.items():
+            if model_name in model_params and isinstance(params, dict):
+                model_params[model_name].update(params)
+
+    return {
+        "valid_models": valid_models,
+        "model_params": model_params,
+    }
+
+
+_APP_CONFIG = _load_config()
+VALID_MODELS = _APP_CONFIG["valid_models"]
+MODEL_PARAMS = _APP_CONFIG["model_params"]
+DEFAULT_MODEL_TYPE = VALID_MODELS[0]
 
 # ---------------------------------------------------------------------------
 # PyTorch helpers (imported lazily inside the classes that need them)
@@ -240,29 +338,31 @@ class ForecastModel:
         random_forest | xgboost | lightgbm | sarimax | lstm | transformer
     """
 
-    # ----- hyper-parameters exposed as class-level defaults ----------------
-    SKLEARN_DEFAULTS = dict(n_estimators=200, random_state=42, n_jobs=-1)
-    SARIMAX_ORDER       = (1, 1, 1)
-    SARIMAX_SEAS_ORDER  = (1, 1, 1, 24)          # hourly seasonality
-    LSTM_SEQ_LEN        = 48
-    LSTM_HIDDEN         = 128
-    LSTM_LAYERS         = 2
-    LSTM_DROPOUT        = 0.2
-    TRANSFORMER_SEQ_LEN = 48
-    TRANSFORMER_D_MODEL = 64
-    TRANSFORMER_NHEAD   = 4
-    TRANSFORMER_LAYERS  = 2
-    TRANSFORMER_DROPOUT = 0.1
-    DL_EPOCHS           = 30
-    DL_BATCH_SIZE       = 256
-    DL_LR               = 1e-3
-    # -----------------------------------------------------------------------
-
-    def __init__(self, model_type: str = "random_forest"):
+    def __init__(self, model_type: str = DEFAULT_MODEL_TYPE):
         self.time_column    = "delivery_time"
         self.predict_column = "production_normalized"
         self.n_splits       = 5
         self.model_type     = self._validate(model_type)
+        self.SKLEARN_DEFAULTS = dict(n_estimators=200, random_state=42, n_jobs=-1)
+        self.XGBOOST_TREE_METHOD = "hist"
+        self.LIGHTGBM_VERBOSE = -1
+        self.SARIMAX_ORDER = (1, 1, 1)
+        self.SARIMAX_SEAS_ORDER = (1, 1, 1, 24)
+        self.SARIMAX_ENFORCE_STATIONARITY = False
+        self.SARIMAX_ENFORCE_INVERTIBILITY = False
+        self.LSTM_SEQ_LEN = 48
+        self.LSTM_HIDDEN = 128
+        self.LSTM_LAYERS = 2
+        self.LSTM_DROPOUT = 0.2
+        self.TRANSFORMER_SEQ_LEN = 48
+        self.TRANSFORMER_D_MODEL = 64
+        self.TRANSFORMER_NHEAD = 4
+        self.TRANSFORMER_LAYERS = 2
+        self.TRANSFORMER_DROPOUT = 0.1
+        self.DL_EPOCHS = 30
+        self.DL_BATCH_SIZE = 256
+        self.DL_LR = 1e-3
+        self._apply_model_params_from_config()
         self.model          = None          # built lazily or at train time
         self.scaler_X       = None          # used by LSTM / Transformer
         self.scaler_y       = None          # used by LSTM / Transformer
@@ -335,7 +435,7 @@ class ForecastModel:
                 n_estimators=self.SKLEARN_DEFAULTS["n_estimators"],
                 random_state=self.SKLEARN_DEFAULTS["random_state"],
                 n_jobs=self.SKLEARN_DEFAULTS["n_jobs"],
-                tree_method="hist",
+                tree_method=self.XGBOOST_TREE_METHOD,
             )
         if self.model_type == "lightgbm":
             from lightgbm import LGBMRegressor
@@ -343,8 +443,52 @@ class ForecastModel:
                 n_estimators=self.SKLEARN_DEFAULTS["n_estimators"],
                 random_state=self.SKLEARN_DEFAULTS["random_state"],
                 n_jobs=self.SKLEARN_DEFAULTS["n_jobs"],
-                verbose=-1,
+                verbose=self.LIGHTGBM_VERBOSE,
             )
+
+    def _apply_model_params_from_config(self) -> None:
+        params = MODEL_PARAMS.get(self.model_type, {})
+
+        if self.model_type in ("random_forest", "xgboost", "lightgbm"):
+            for key in ("n_estimators", "random_state", "n_jobs"):
+                if key in params:
+                    self.SKLEARN_DEFAULTS[key] = params[key]
+            if self.model_type == "xgboost" and "tree_method" in params:
+                self.XGBOOST_TREE_METHOD = params["tree_method"]
+            if self.model_type == "lightgbm" and "verbose" in params:
+                self.LIGHTGBM_VERBOSE = params["verbose"]
+            return
+
+        if self.model_type == "sarimax":
+            if "order" in params:
+                self.SARIMAX_ORDER = tuple(params["order"])
+            if "seasonal_order" in params:
+                self.SARIMAX_SEAS_ORDER = tuple(params["seasonal_order"])
+            if "enforce_stationarity" in params:
+                self.SARIMAX_ENFORCE_STATIONARITY = params["enforce_stationarity"]
+            if "enforce_invertibility" in params:
+                self.SARIMAX_ENFORCE_INVERTIBILITY = params["enforce_invertibility"]
+            return
+
+        if self.model_type == "lstm":
+            self.LSTM_SEQ_LEN = params.get("seq_len", self.LSTM_SEQ_LEN)
+            self.LSTM_HIDDEN = params.get("hidden_size", self.LSTM_HIDDEN)
+            self.LSTM_LAYERS = params.get("num_layers", self.LSTM_LAYERS)
+            self.LSTM_DROPOUT = params.get("dropout", self.LSTM_DROPOUT)
+            self.DL_EPOCHS = params.get("epochs", self.DL_EPOCHS)
+            self.DL_BATCH_SIZE = params.get("batch_size", self.DL_BATCH_SIZE)
+            self.DL_LR = params.get("learning_rate", self.DL_LR)
+            return
+
+        if self.model_type == "transformer":
+            self.TRANSFORMER_SEQ_LEN = params.get("seq_len", self.TRANSFORMER_SEQ_LEN)
+            self.TRANSFORMER_D_MODEL = params.get("d_model", self.TRANSFORMER_D_MODEL)
+            self.TRANSFORMER_NHEAD = params.get("nhead", self.TRANSFORMER_NHEAD)
+            self.TRANSFORMER_LAYERS = params.get("num_layers", self.TRANSFORMER_LAYERS)
+            self.TRANSFORMER_DROPOUT = params.get("dropout", self.TRANSFORMER_DROPOUT)
+            self.DL_EPOCHS = params.get("epochs", self.DL_EPOCHS)
+            self.DL_BATCH_SIZE = params.get("batch_size", self.DL_BATCH_SIZE)
+            self.DL_LR = params.get("learning_rate", self.DL_LR)
 
     # ------------------------------------------------------------------
     # sklearn / tree training  (fixes the variable-shadowing bug)
@@ -400,8 +544,8 @@ class ForecastModel:
                     train_s,
                     order=self.SARIMAX_ORDER,
                     seasonal_order=self.SARIMAX_SEAS_ORDER,
-                    enforce_stationarity=False,
-                    enforce_invertibility=False,
+                    enforce_stationarity=self.SARIMAX_ENFORCE_STATIONARITY,
+                    enforce_invertibility=self.SARIMAX_ENFORCE_INVERTIBILITY,
                 ).fit(disp=False)
                 preds = res.forecast(steps=len(val_s))
                 maes.append(mean_absolute_error(val_s, preds))
@@ -416,8 +560,8 @@ class ForecastModel:
             series,
             order=self.SARIMAX_ORDER,
             seasonal_order=self.SARIMAX_SEAS_ORDER,
-            enforce_stationarity=False,
-            enforce_invertibility=False,
+            enforce_stationarity=self.SARIMAX_ENFORCE_STATIONARITY,
+            enforce_invertibility=self.SARIMAX_ENFORCE_INVERTIBILITY,
         ).fit(disp=False)
 
     def _predict_sarimax(self, df: pd.DataFrame) -> np.ndarray:

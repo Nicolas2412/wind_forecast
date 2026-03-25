@@ -9,3 +9,4 @@ statsmodels
 torch
 matplotlib
 seaborn
+PyYAML

@@ -1,7 +1,7 @@
 import argparse
-from tools import DataProcessor, ForecastModel, VALID_MODELS
+from tools import DataProcessor, ForecastModel, VALID_MODELS, DEFAULT_MODEL_TYPE
 
-def main(evaluation_point : int = 30, model_type: str = "random_forest"):
+def main(evaluation_point : int = 30, model_type: str = DEFAULT_MODEL_TYPE):
     path_folder = "data/"
     processor = DataProcessor(path_folder)
     df = processor.run()
@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run model.")
     parser.add_argument("-model",
                         choices = VALID_MODELS,
-                        default="random_forest",
+                        default=DEFAULT_MODEL_TYPE,
                         help="Type of model to use")
     parser.add_argument("-eval_point",
                         type=int,
