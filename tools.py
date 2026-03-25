@@ -1,3 +1,4 @@
+from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -91,6 +92,12 @@ class DataProcessor:
         self.predict_column = "production_normalized"
         self.drop_columns = drop_columns
         self.df = self.open_data() if X is None else X
+        
+    def run(self) -> pd.DataFrame:
+        """Run the full processing pipeline."""
+        df = self.prepocess_data()
+        df = self.engineer_features(df)
+        return df
 
     def open_data(self) -> pd.DataFrame:
         """Open and merge data while fixing type mismatches"""
@@ -150,7 +157,7 @@ class DataProcessor:
         df["dow_cos"]     = np.cos(2 * np.pi * df["day_of_week"] / 7)
 
         df["production_normalized"] = df["production"] / df["installed_capacity"]
-        df.drop(columns=["production", "installed_capacity"], inplace=True)
+        # df.drop(columns=["production", "installed_capacity"], inplace=True)
 
         df["wind_speed_diff"]  = df["wind_speed_100m"] - df["wind_speed_10m"]
         for col in ["wind_speed_10m", "wind_speed_100m"]:
@@ -182,18 +189,30 @@ class DataProcessor:
             final_mask = np.logical_and.reduce(mask_columns)
             df = df[final_mask]
 
-        df.drop(columns=self.drop_columns, inplace=True, errors="ignore")
+        # df.drop(columns=self.drop_columns, inplace=True, errors="ignore")
         df = df.replace([np.inf, -np.inf], np.nan)
-        df = df.dropna(subset=[self.time_column, self.predict_column])
+        # df = df.dropna(subset=[self.time_column, self.predict_column])
 
         return df
     
-    def run(self) -> pd.DataFrame:
-        """Run the full processing pipeline."""
-        df = self.prepocess_data()
-        df = self.engineer_features(df)
-        return df
+    def finalize_for_model(self, df):
+        # 1. On définit ce qu'on veut exclure
+        # Note: J'ajoute "site_name" ici si tu ne le veux pas dans le modèle final
+        to_exclude = [self.time_column] + self.drop_columns
 
+        # 2. On identifie les colonnes à GARDER (features + cible)
+        # On s'assure de ne garder que ce qui existe réellement dans le df
+        cols_to_keep = [c for c in df.columns if c not in to_exclude]
+
+        # 3. Création du masque de lignes (on vérifie les NaN sur les colonnes conservées)
+        # On vérifie que TOUTES les colonnes gardées sont non-nulles sur la ligne
+        mask = df[cols_to_keep].notna().all(axis=1)
+
+        # 4. On filtre les LIGNES avec le masque ET les COLONNES avec cols_to_keep
+        df_final = df.loc[mask, cols_to_keep]
+
+        print(df_final.columns)
+        return df_final
 
 def compute_plateau(df: pd.DataFrame, N: int = 5, window: str = "24h", tolerance: float = 0.01, low_thresh: float = 0.1, high_thresh: float = 0.9):
 
@@ -260,7 +279,7 @@ class ForecastModel:
 
     VALID_MODELS = ["random_forest", "xgboost", "lightgbm", "sarimax", "lstm", "transformer"]
 
-    def __init__(self, model_type: str = "random_forest"):
+    def __init__(self, model_type: str = "random_forest", savepath:str=None):
         self.time_column    = "delivery_time"
         self.predict_column = "production_normalized"
         self.n_splits       = 5
@@ -269,7 +288,9 @@ class ForecastModel:
         self.scaler_X       = None          # used by LSTM / Transformer
         self.scaler_y       = None          # used by LSTM / Transformer
         self.evaluation_results: dict = {}
-
+        self.savepath = savepath
+        
+        
         # Build sklearn / tree models immediately (lightweight)
         if self.model_type in ("random_forest", "xgboost", "lightgbm"):
             self.model = self._build_sklearn_model()
@@ -290,23 +311,28 @@ class ForecastModel:
         }
         dispatch[self.model_type](df)
 
-    def evaluate(self, df: pd.DataFrame = None) -> dict:
+    def evaluate(self, df: pd.DataFrame = None, plot:bool=False) -> dict:
         """Return stored cross-validation metrics."""
         results = dict(self.evaluation_results)
         if df is not None:
-            processed = DataProcessor(path_folder="", X=df).run()
             prediction = self.predict(df)
-            y_true = processed[self.predict_column].to_numpy()
+            y_true = df[self.predict_column].to_numpy()
             if len(prediction) != len(y_true):
                 y_true = y_true[-len(prediction):]
             results["eval_mae"] = float(mean_absolute_error(y_true, prediction))
+            
+            if plot:
+                plt.plot(prediction,color='red',label='prediction')
+                plt.plot(y_true,color='blue',label='truth')
+                plt.legend()
+                plt.show()
         return results
+    
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
-        """Predict on a new DataFrame (raw, before feature engineering)."""
+        """Predict on a new DataFrame."""
         if self.model is None:
             raise ValueError("Model has not been trained yet.")
-        processed = DataProcessor(path_folder="", X=df).run()
         dispatch = {
             "random_forest": self._predict_sklearn,
             "xgboost":       self._predict_sklearn,
@@ -315,7 +341,60 @@ class ForecastModel:
             "lstm":          self._predict_deep,
             "transformer":   self._predict_deep,
         }
-        return dispatch[self.model_type](processed)
+        return dispatch[self.model_type](df)
+
+    def save(self, path: str = None) -> None:
+        """Save the trained model to disk."""
+        import joblib
+        save_path = path or self.savepath
+        if not save_path:
+            raise ValueError("No save path provided.")
+        if self.model is None:
+            raise ValueError("No model to save. Train the model first.")
+            
+        save_path = str(save_path)
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        
+        if self.model_type in ("lstm", "transformer"):
+            import torch
+            checkpoint = {
+                'model_state_dict': self.model.state_dict(),
+                'scaler_X': self.scaler_X,
+                'scaler_y': self.scaler_y,
+                'input_size': getattr(self, 'input_size', None)
+            }
+            torch.save(checkpoint, save_path)
+        elif self.model_type == "sarimax":
+            self.model.save(save_path)
+        else:
+            joblib.dump(self.model, save_path)
+        print(f"[{self.model_type}] Model saved to {save_path}")
+
+    def load(self, path: str = None) -> None:
+        """Load a trained model from disk."""
+        import joblib
+        load_path = path or self.savepath
+        if not load_path:
+            raise ValueError("No load path provided.")
+            
+        load_path = str(load_path)
+        if not Path(load_path).exists():
+            raise FileNotFoundError(f"Model file not found: {load_path}")
+            
+        if self.model_type in ("lstm", "transformer"):
+            import torch
+            checkpoint = torch.load( load_path, map_location=torch.device('cpu'), weights_only=False)
+            self.input_size = checkpoint['input_size']
+            self.scaler_X = checkpoint['scaler_X']
+            self.scaler_y = checkpoint['scaler_y']
+            self.model = self._build_dl_model(self.input_size)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+        elif self.model_type == "sarimax":
+            import statsmodels.api as sm
+            self.model = sm.load(load_path)
+        else:
+            self.model = joblib.load(load_path)
+        print(f"[{self.model_type}] Model loaded from {load_path}")
 
     # ------------------------------------------------------------------
     # Model builders
@@ -459,92 +538,190 @@ class ForecastModel:
             dropout=self.TRANSFORMER_DROPOUT,
         )
 
-    def _train_deep(self, df: pd.DataFrame) -> None:
+    def _train_deep(self, df: pd.DataFrame):
+        import copy
         import torch
         import torch.nn as nn
         from torch.utils.data import TensorDataset, DataLoader
 
-        params  = self._get_dl_params()
+        feat_cols = [c for c in df.columns if c not in (
+            self.time_column, self.predict_column)]
+
+        def _to_arrays(frame):
+            mask = frame[feat_cols].notna().all(
+                axis=1) & frame[self.predict_column].notna()
+            f = frame[mask]
+            return (
+                f[feat_cols].values.astype(np.float32),
+                f[self.predict_column].values.astype(np.float32),
+            )
+
+        X_raw, y_raw = _to_arrays(df)
+
+        params = self._get_dl_params()
         seq_len = params["seq_len"]
+        tscv = TimeSeriesSplit(n_splits=self.n_splits)
 
-        feat_cols = [c for c in df.columns if c not in (self.time_column, self.predict_column)]
-        df_clean  = df.dropna(subset=feat_cols + [self.predict_column])
+        # ------------------------------------------------------------------ #
+        #  Phase 1 : Cross-validation                                         #
+        #  But : estimer la perf + calibrer le nombre d'epochs pour le refit  #
+        # ------------------------------------------------------------------ #
+        fold_maes, fold_best_epochs = [], []
 
-        X_raw = df_clean[feat_cols].values.astype(np.float32)
-        y_raw = df_clean[self.predict_column].values.astype(np.float32)
+        for fold, (train_idx, val_idx) in enumerate(tscv.split(X_raw)):
+            print(f"Starting Cross validation on fold {fold}/{self.n_splits}")
+            X_tr_raw, y_tr_raw = X_raw[train_idx], y_raw[train_idx]
+            X_val_raw, y_val_raw = X_raw[val_idx],  y_raw[val_idx]
 
-        # tscv = TimeSeriesSplit(n_splits=self.n_splits)
-        # maes = []
-        # idx  = np.arange(len(X_raw))
+            # Scaler fitté sur le train du fold uniquement — pas de leakage
+            scaler_X_fold = StandardScaler().fit(X_tr_raw)
+            scaler_y_fold = StandardScaler().fit(y_tr_raw.reshape(-1, 1))
 
-        # for fold, (train_idx, val_idx) in enumerate(tscv.split(idx)):
-        #     X_tr_raw, y_tr_raw = X_raw[train_idx], y_raw[train_idx]
-        #     X_val_raw, y_val_raw = X_raw[val_idx], y_raw[val_idx]
+            X_tr_sc = scaler_X_fold.transform(X_tr_raw)
+            y_tr_sc = scaler_y_fold.transform(y_tr_raw.reshape(-1, 1)).ravel()
 
-        #     scaler_X_fold = StandardScaler().fit(X_tr_raw)
-        #     scaler_y_fold = StandardScaler().fit(y_tr_raw.reshape(-1, 1))
+            # Zone de contexte : les seq_len derniers points du train
+            # servent de "passé" pour que les premières séquences val soient complètes
+            ctx_start = val_idx[0] - seq_len
+            if ctx_start < 0:
+                print(f"  [fold {fold+1}] Pas assez de contexte, fold ignoré.")
+                continue
 
-        #     X_tr_sc = scaler_X_fold.transform(X_tr_raw)
-        #     y_tr_sc = scaler_y_fold.transform(y_tr_raw.reshape(-1, 1)).ravel()
-        #     X_val_sc = scaler_X_fold.transform(X_val_raw)
-        #     y_val_sc = scaler_y_fold.transform(y_val_raw.reshape(-1, 1)).ravel()
+            ctx_X = scaler_X_fold.transform(X_raw[ctx_start:val_idx[0]])
+            ctx_y = scaler_y_fold.transform(
+                y_raw[ctx_start:val_idx[0]].reshape(-1, 1)).ravel()
 
-        #     X_tr, y_tr = _make_sequences(X_tr_sc, y_tr_sc, seq_len)
-        #     X_val_s, y_val_s = _make_sequences(X_val_sc, y_val_sc, seq_len)
-        #     if len(X_tr) == 0 or len(X_val_s) == 0:
-        #         continue
+            X_val_sc = np.concatenate([ctx_X, scaler_X_fold.transform(X_val_raw)])
+            y_val_sc = np.concatenate(
+                [ctx_y, scaler_y_fold.transform(y_val_raw.reshape(-1, 1)).ravel()])
 
-        #     net = self._build_dl_model(X_tr.shape[2])
-        #     opt = torch.optim.Adam(net.parameters(), lr=self.DL_LR)
-        #     loss_fn = nn.MSELoss()
-        #     loader  = DataLoader(
-        #         TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr)),
-        #         batch_size=params["batch"], shuffle=False,
-        #     )
-        #     net.train()
-        #     for _ in range(params["epochs"]):
-        #         for xb, yb in loader:
-        #             opt.zero_grad()
-        #             loss_fn(net(xb), yb).backward()
-        #             opt.step()
+            # Séquençage à l'intérieur du fold
+            X_tr_seq,  y_tr_seq = _make_sequences(X_tr_sc,  y_tr_sc,  seq_len)
+            X_val_seq, y_val_seq = _make_sequences(X_val_sc, y_val_sc, seq_len)
 
-        #     net.eval()
-        #     with torch.no_grad():
-        #         preds_sc = net(torch.from_numpy(X_val_s)).numpy()
-        #     preds = scaler_y_fold.inverse_transform(preds_sc.reshape(-1, 1)).ravel()
-        #     truth = scaler_y_fold.inverse_transform(y_val_s.reshape(-1, 1)).ravel()
-        #     maes.append(mean_absolute_error(truth, preds))
-        #     print(f"  [{self.model_type}] fold {fold+1} MAE: {maes[-1]:.4f}")
+            if len(X_tr_seq) == 0 or len(X_val_seq) == 0:
+                print(f"  [fold {fold+1}] Séquences vides, fold ignoré.")
+                continue
 
-        # cv_mae = float(np.mean(maes)) if maes else float("nan")
-        # self.evaluation_results = {"cv_mae": cv_mae, "cv_mae_std": float(np.std(maes))}
-        # print(f"[{self.model_type}] CV MAE: {cv_mae:.4f}")
+            # Modèle frais pour chaque fold
+            net = self._build_dl_model(X_tr_seq.shape[2])
+            opt = torch.optim.Adam(net.parameters(), lr=self.DL_LR)
+            loss_fn = nn.MSELoss()
 
+            train_loader = DataLoader(
+                TensorDataset(torch.from_numpy(X_tr_seq),
+                            torch.from_numpy(y_tr_seq)),
+                batch_size=params["batch"], shuffle=False,
+            )
+            val_loader = DataLoader(
+                TensorDataset(torch.from_numpy(X_val_seq),
+                            torch.from_numpy(y_val_seq)),
+                batch_size=params["batch"], shuffle=False,
+            )
+
+            best_val_loss = float("inf")
+            best_epoch = 0
+            patience_cnt = 0
+            patience = getattr(self, "DL_PATIENCE", 10)
+            grad_clip = getattr(self, "DL_GRAD_CLIP", 1.0)
+
+            for epoch in tqdm(range(1, params["epochs"] + 1)):
+                net.train()
+                for xb, yb in train_loader:
+                    opt.zero_grad()
+                    loss = loss_fn(net(xb), yb)
+                    loss.backward()
+                    if grad_clip > 0:
+                        nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
+                    opt.step()
+
+                net.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    for xb, yb in val_loader:
+                        val_loss += loss_fn(net(xb), yb).item()
+                val_loss /= len(val_loader)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_epoch = epoch
+                    patience_cnt = 0
+                else:
+                    patience_cnt += 1
+                    if patience_cnt >= patience:
+                        break
+
+            # MAE en unités originales
+            net.eval()
+            with torch.no_grad():
+                preds_sc = net(torch.from_numpy(X_val_seq)).numpy()
+            preds = scaler_y_fold.inverse_transform(
+                preds_sc.reshape(-1, 1)).ravel()
+            truth = scaler_y_fold.inverse_transform(
+                y_val_seq.reshape(-1, 1)).ravel()
+            fold_mae = float(mean_absolute_error(truth, preds))
+
+            fold_maes.append(fold_mae)
+            fold_best_epochs.append(best_epoch)
+            print(f"  [{self.model_type}] fold {fold+1} | MAE: {fold_mae:.4f} | best epoch: {best_epoch}")
+
+        cv_mae = float(np.mean(fold_maes)) if fold_maes else float("nan")
+        # Médiane des best epochs — plus robuste que la moyenne aux folds extrêmes
+        refit_epochs = int(np.median(fold_best_epochs)) if fold_best_epochs else params["epochs"]
+        print(f"\n[{self.model_type}] CV MAE: {cv_mae:.4f} ± {np.std(fold_maes):.4f}")
+        print(f"[{self.model_type}] Refit sur {refit_epochs} epochs (médiane des best epochs par fold)")
+
+        self.evaluation_results = {
+            "cv_mae":      cv_mae,
+            "cv_mae_std":  float(np.std(fold_maes)),
+            "refit_epochs": refit_epochs,
+        }
+
+        # ------------------------------------------------------------------ #
+        #  Phase 2 : Refit sur toutes les données train                       #
+        #  Scaler refitté sur tout le train, epochs = médiane des best epochs #
+        # ------------------------------------------------------------------ #
         self.scaler_X = StandardScaler().fit(X_raw)
         self.scaler_y = StandardScaler().fit(y_raw.reshape(-1, 1))
+
         X_sc = self.scaler_X.transform(X_raw)
         y_sc = self.scaler_y.transform(y_raw.reshape(-1, 1)).ravel()
 
-        X_full, y_full = _make_sequences(X_sc, y_sc, seq_len)
-        self.model = self._build_dl_model(X_full.shape[2])
-        opt     = torch.optim.Adam(self.model.parameters(), lr=self.DL_LR)
+        X_seq, y_seq = _make_sequences(X_sc, y_sc, seq_len)
+
+        self.input_size = X_seq.shape[2]
+        self.model = self._build_dl_model(self.input_size)
+        opt = torch.optim.Adam(self.model.parameters(), lr=self.DL_LR)
         loss_fn = nn.MSELoss()
-        loader  = DataLoader(
-            TensorDataset(torch.from_numpy(X_full), torch.from_numpy(y_full)),
+        grad_clip = getattr(self, "DL_GRAD_CLIP", 1.0)
+
+        loader = DataLoader(
+            TensorDataset(torch.from_numpy(X_seq), torch.from_numpy(y_seq)),
             batch_size=params["batch"], shuffle=False,
         )
+
+        loss_history = {"train": [], "eval": []}
+
         self.model.train()
-        for epoch in tqdm(range(params["epochs"])):
+        for epoch in tqdm(range(1, refit_epochs + 1)):
             epoch_loss = 0.0
             for xb, yb in loader:
                 opt.zero_grad()
-                l = loss_fn(self.model(xb), yb)
-                l.backward()
+                loss = loss_fn(self.model(xb), yb)
+                loss.backward()
+                if grad_clip > 0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                 opt.step()
-                epoch_loss += l.item()
-            if (epoch + 1) % 10 == 0:
-                print(f"  [{self.model_type}] epoch {epoch+1}/{params['epochs']} "
-                    f"loss: {epoch_loss/len(loader):.6f}")
+                epoch_loss += loss.item()
+            avg_loss = epoch_loss / len(loader)
+            loss_history["train"].append(avg_loss)
+
+            if epoch % 5 == 0 or epoch == refit_epochs:
+                print(
+                    f"  [refit] epoch {epoch}/{refit_epochs} | loss: {avg_loss:.6f}")
+        print('end')
+        # Pas de val loss pendant le refit — on n'a pas de set de val dédié
+        return loss_history
 
     def _predict_deep(self, df: pd.DataFrame) -> np.ndarray:
         import torch
