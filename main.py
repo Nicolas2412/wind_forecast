@@ -1,9 +1,9 @@
-from tools import DataProcessor, ForecastModel
+import argparse
+from tools import DataProcessor, ForecastModel, VALID_MODELS, DEFAULT_MODEL_TYPE
 
-def main(evaluation_point : int = 30, model_type: str = "random_forest"):
+def main(evaluation_point : int = 30, model_type: str = DEFAULT_MODEL_TYPE):
     path_folder = "data/"
-    processor = DataProcessor(path_folder, ["site_name"])
-    # print(processor.df.head())
+    processor = DataProcessor(path_folder)
     df = processor.run()
 
     forecastModel = ForecastModel(model_type=model_type)
@@ -12,7 +12,18 @@ def main(evaluation_point : int = 30, model_type: str = "random_forest"):
     print("Starting to train")
     forecastModel.train(df_train)
     print("Starting to evaluate")
-    forecastModel.evaluate(df_eval)
+    eval = forecastModel.evaluate(df_eval)
+    print("Evaluation results:", eval)
 
 if __name__ == "__main__":
-    main(model_type='lstm')
+    parser = argparse.ArgumentParser(description="Run model.")
+    parser.add_argument("-model",
+                        choices = VALID_MODELS,
+                        default=DEFAULT_MODEL_TYPE,
+                        help="Type of model to use")
+    parser.add_argument("-eval_point",
+                        type=int,
+                        default=30,
+                        help="Number of most recent data points to use for evaluation")
+    args = parser.parse_args()
+    main(model_type=args.model, evaluation_point=args.eval_point)
