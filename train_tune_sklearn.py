@@ -120,23 +120,23 @@ def engineer_features_dayahead(
         grp = grp.reindex(full_idx)
         grp["site_name"] = site
 
-        # --- Lags causaux (>= data_delay_days * 24h) ---
-        # lag_360h : même heure, J-15 — premier lag disponible
-        grp[f"production_lag{min_lag_h}h"] = grp["production_normalized"].shift(min_lag_h)
-        # lag_384h : même heure, J-16
-        grp[f"production_lag{min_lag_h + 24}h"] = grp["production_normalized"].shift(min_lag_h + 24)
-        # lag_720h : même heure, J-30 (capture la saisonnalité mensuelle)
-        grp["production_lag720h"] = grp["production_normalized"].shift(720)
+        # # --- Lags causaux (>= data_delay_days * 24h) ---
+        # # lag_360h : même heure, J-15 — premier lag disponible
+        # grp[f"production_lag{min_lag_h}h"] = grp["production_normalized"].shift(min_lag_h)
+        # # lag_384h : même heure, J-16
+        # grp[f"production_lag{min_lag_h + 24}h"] = grp["production_normalized"].shift(min_lag_h + 24)
+        # # lag_720h : même heure, J-30 (capture la saisonnalité mensuelle)
+        # grp["production_lag720h"] = grp["production_normalized"].shift(720)
 
-        # --- Statistiques glissantes causales ---
-        # On shifte d'abord de min_lag_h pour que la fenêtre commence à J-15
-        shifted = grp["production_normalized"].shift(min_lag_h)
-        # Fenêtre 7 jours (168h) sur [J-15, J-22]
-        grp["production_rolling_mean_7d"] = shifted.rolling(168, min_periods=84).mean()
-        grp["production_rolling_std_7d"]  = shifted.rolling(168, min_periods=84).std()
-        # Fenêtre 14 jours (336h) sur [J-15, J-29]
-        grp["production_rolling_mean_14d"] = shifted.rolling(336, min_periods=168).mean()
-        grp["production_rolling_std_14d"]  = shifted.rolling(336, min_periods=168).std()
+        # # --- Statistiques glissantes causales ---
+        # # On shifte d'abord de min_lag_h pour que la fenêtre commence à J-15
+        # shifted = grp["production_normalized"].shift(min_lag_h)
+        # # Fenêtre 7 jours (168h) sur [J-15, J-22]
+        # grp["production_rolling_mean_7d"] = shifted.rolling(168, min_periods=84).mean()
+        # grp["production_rolling_std_7d"]  = shifted.rolling(168, min_periods=84).std()
+        # # Fenêtre 14 jours (336h) sur [J-15, J-29]
+        # grp["production_rolling_mean_14d"] = shifted.rolling(336, min_periods=168).mean()
+        # grp["production_rolling_std_14d"]  = shifted.rolling(336, min_periods=168).std()
 
         # --- Suppression des lignes de maintenance APRÈS calcul des lags ---
         if "is_not_plateau" in grp.columns:
@@ -146,20 +146,20 @@ def engineer_features_dayahead(
 
     df = pd.concat(results, ignore_index=True)
 
-    # --- Features physiques vent (issues du NWP, toujours disponibles) ---
-    if "wind_direction_100m" in df.columns:
-        rad = np.radians(df["wind_direction_100m"])
-        # Convention météo : direction = origine du vent (0°=Nord, 90°=Est)
-        # U (zonal, positif vers l'Est)     = -speed * sin(dir)
-        # V (méridional, positif vers le Nord) = -speed * cos(dir)
-        df["wind_u_100m"] = -df["wind_speed_100m"] * np.sin(rad)
-        df["wind_v_100m"] = -df["wind_speed_100m"] * np.cos(rad)
+    # # --- Features physiques vent (issues du NWP, toujours disponibles) ---
+    # if "wind_direction_100m" in df.columns:
+    #     rad = np.radians(df["wind_direction_100m"])
+    #     # Convention météo : direction = origine du vent (0°=Nord, 90°=Est)
+    #     # U (zonal, positif vers l'Est)     = -speed * sin(dir)
+    #     # V (méridional, positif vers le Nord) = -speed * cos(dir)
+    #     df["wind_u_100m"] = -df["wind_speed_100m"] * np.sin(rad)
+    #     df["wind_v_100m"] = -df["wind_speed_100m"] * np.cos(rad)
 
-    if "temperature_2m" in df.columns and "pressure_msl" in df.columns:
-        # Densité de l'air : ρ = P / (R_d * T),  R_d = 287.05 J/(kg·K)
-        df["air_density"] = df["pressure_msl"] / (287.05 * (df["temperature_2m"] + 273.15))
-        # Puissance éolienne théorique ∝ ρ·v³ (avant coefficient de puissance Cp)
-        df["theoretical_power"] = df["air_density"] * df["wind_speed_100m"] ** 3
+    # if "temperature_2m" in df.columns and "pressure_msl" in df.columns:
+    #     # Densité de l'air : ρ = P / (R_d * T),  R_d = 287.05 J/(kg·K)
+    #     df["air_density"] = df["pressure_msl"] / (287.05 * (df["temperature_2m"] + 273.15))
+    #     # Puissance éolienne théorique ∝ ρ·v³ (avant coefficient de puissance Cp)
+    #     df["theoretical_power"] = df["air_density"] * df["wind_speed_100m"] ** 3
 
     # --- Nettoyage des colonnes intermédiaires et anciens lags leakés ---
     drop_cols = ["is_not_plateau", "similar_count",
@@ -761,3 +761,5 @@ if __name__ == "__main__":
                                       site= site,
                                       )
             run_pipeline(site_args)
+    else:
+        run_pipeline(args)

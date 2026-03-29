@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html>
+<head>
+    
+    <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+    <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/css/bootstrap.min.css"/>
+    <link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.0/css/bootstrap-glyphicons.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.2.0/css/all.min.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/python-visualization/folium/folium/templates/leaflet.awesome.rotate.min.css"/>
+    
+            <meta name="viewport" content="width=device-width,
+                initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+            <style>
+                #map_f129badc733c305bf82d556ffe0d2778 {
+                    position: relative;
+                    width: 100.0%;
+                    height: 100.0%;
+                    left: 0.0%;
+                    top: 0.0%;
+                }
+                .leaflet-container { font-size: 1rem; }
+            </style>
+
+            <style>html, body {
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                padding: 0;
+            }
+            </style>
+
+            <style>#map {
+                position:absolute;
+                top:0;
+                bottom:0;
+                right:0;
+                left:0;
+                }
+            </style>
+
+            <script>
+                L_NO_TOUCH = false;
+                L_DISABLE_3D = false;
+            </script>
+
+        
+</head>
+<body>
+    
+    
+            <div class="folium-map" id="map_f129badc733c305bf82d556ffe0d2778" ></div>
+        
+</body>
+<script>
+    
+    
+            var map_f129badc733c305bf82d556ffe0d2778 = L.map(
+                "map_f129badc733c305bf82d556ffe0d2778",
+                {
+                    center: [51.619319999999995, 2.87481],
+                    crs: L.CRS.EPSG3857,
+                    ...{
+  "zoom": 12,
+  "zoomControl": true,
+  "preferCanvas": false,
+}
+
+                }
+            );
+
+            
+
+        
+    
+            var tile_layer_8ad799b8a46bc51360dadec239e7e698 = L.tileLayer(
+                "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                {
+  "minZoom": 0,
+  "maxZoom": 19,
+  "maxNativeZoom": 19,
+  "noWrap": false,
+  "attribution": "\u0026copy; \u003ca href=\"https://www.openstreetmap.org/copyright\"\u003eOpenStreetMap\u003c/a\u003e contributors",
+  "subdomains": "abc",
+  "detectRetina": false,
+  "tms": false,
+  "opacity": 1,
+}
+
+            );
+        
+    
+            tile_layer_8ad799b8a46bc51360dadec239e7e698.addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+            var marker_42bc9561d16a127c5fb3c0479482158e = L.marker(
+                [51.6631, 2.8339],
+                {
+}
+            ).addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+        var popup_b5db15a37bc2fa39cea62320aa92019c = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_187d2258fd67101b374ed2d989709f56 = $(`<div id="html_187d2258fd67101b374ed2d989709f56" style="width: 100.0%; height: 100.0%;">Nobelwind Offshore Windpark</div>`)[0];
+                popup_b5db15a37bc2fa39cea62320aa92019c.setContent(html_187d2258fd67101b374ed2d989709f56);
+            
+        
+
+        marker_42bc9561d16a127c5fb3c0479482158e.bindPopup(popup_b5db15a37bc2fa39cea62320aa92019c)
+        ;
+
+        
+    
+    
+            var marker_da2e5f255118033cf269e4e26713528d = L.marker(
+                [51.591, 2.944],
+                {
+}
+            ).addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+        var popup_f773d2c401bda6a940c2c14a9966bc58 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_42c40771dcf2ec52d5529303340e8554 = $(`<div id="html_42c40771dcf2ec52d5529303340e8554" style="width: 100.0%; height: 100.0%;">Rentel Offshore WP</div>`)[0];
+                popup_f773d2c401bda6a940c2c14a9966bc58.setContent(html_42c40771dcf2ec52d5529303340e8554);
+            
+        
+
+        marker_da2e5f255118033cf269e4e26713528d.bindPopup(popup_f773d2c401bda6a940c2c14a9966bc58)
+        ;
+
+        
+    
+    
+            var marker_d602e282d28943634f8da84f0f245614 = L.marker(
+                [51.528, 3.032],
+                {
+}
+            ).addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+        var popup_e55249b4379bb789b295acda7d101d8c = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_795bb6de0141861accefe9430a50a355 = $(`<div id="html_795bb6de0141861accefe9430a50a355" style="width: 100.0%; height: 100.0%;">Norther Offshore WP</div>`)[0];
+                popup_e55249b4379bb789b295acda7d101d8c.setContent(html_795bb6de0141861accefe9430a50a355);
+            
+        
+
+        marker_d602e282d28943634f8da84f0f245614.bindPopup(popup_e55249b4379bb789b295acda7d101d8c)
+        ;
+
+        
+    
+    
+            var marker_158ad6d457650cf309a37abc45218aab = L.marker(
+                [51.6875, 2.7488],
+                {
+}
+            ).addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+        var popup_553904654544adc79ace84702fc0fa66 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_981b6919b77022f2eb9a5d93b86fe464 = $(`<div id="html_981b6919b77022f2eb9a5d93b86fe464" style="width: 100.0%; height: 100.0%;">Northwester 2</div>`)[0];
+                popup_553904654544adc79ace84702fc0fa66.setContent(html_981b6919b77022f2eb9a5d93b86fe464);
+            
+        
+
+        marker_158ad6d457650cf309a37abc45218aab.bindPopup(popup_553904654544adc79ace84702fc0fa66)
+        ;
+
+        
+    
+    
+            var marker_e6496eb912ac6645be9c7c0529ed81ac = L.marker(
+                [51.63, 2.8597],
+                {
+}
+            ).addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+        var popup_d5e834d54f333fa2d88efd1e9b36444e = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_adf382ecaecadcd921fe06b88ddbcd1c = $(`<div id="html_adf382ecaecadcd921fe06b88ddbcd1c" style="width: 100.0%; height: 100.0%;">Mermaid Offshore WP</div>`)[0];
+                popup_d5e834d54f333fa2d88efd1e9b36444e.setContent(html_adf382ecaecadcd921fe06b88ddbcd1c);
+            
+        
+
+        marker_e6496eb912ac6645be9c7c0529ed81ac.bindPopup(popup_d5e834d54f333fa2d88efd1e9b36444e)
+        ;
+
+        
+    
+    
+            var marker_40277ad012ef4aec5cfaf86c08a665e2 = L.marker(
+                [51.719, 2.74],
+                {
+}
+            ).addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+        var popup_16df16b8cd6905b8a6a256b647522e7b = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_cac76838348737a8e3ae7f0bd18d5fd8 = $(`<div id="html_cac76838348737a8e3ae7f0bd18d5fd8" style="width: 100.0%; height: 100.0%;">Seastar Offshore WP</div>`)[0];
+                popup_16df16b8cd6905b8a6a256b647522e7b.setContent(html_cac76838348737a8e3ae7f0bd18d5fd8);
+            
+        
+
+        marker_40277ad012ef4aec5cfaf86c08a665e2.bindPopup(popup_16df16b8cd6905b8a6a256b647522e7b)
+        ;
+
+        
+    
+    
+            var marker_eb893f27222e9a652859bb74844182fc = L.marker(
+                [51.66, 2.8],
+                {
+}
+            ).addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+        var popup_733a0fd4a9c64ea12e604fb035436644 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_29eb0efd166ce94d58bf652cc95d4fe1 = $(`<div id="html_29eb0efd166ce94d58bf652cc95d4fe1" style="width: 100.0%; height: 100.0%;">Belwind Phase 1</div>`)[0];
+                popup_733a0fd4a9c64ea12e604fb035436644.setContent(html_29eb0efd166ce94d58bf652cc95d4fe1);
+            
+        
+
+        marker_eb893f27222e9a652859bb74844182fc.bindPopup(popup_733a0fd4a9c64ea12e604fb035436644)
+        ;
+
+        
+    
+    
+            var marker_38e5153572c6302425d70f3ed17c5def = L.marker(
+                [51.6186, 2.8998],
+                {
+}
+            ).addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+        var popup_c241e252176da03f66e092f0f9992bb1 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_fc976b55c146f904cdc527ddb6443c97 = $(`<div id="html_fc976b55c146f904cdc527ddb6443c97" style="width: 100.0%; height: 100.0%;">Northwind</div>`)[0];
+                popup_c241e252176da03f66e092f0f9992bb1.setContent(html_fc976b55c146f904cdc527ddb6443c97);
+            
+        
+
+        marker_38e5153572c6302425d70f3ed17c5def.bindPopup(popup_c241e252176da03f66e092f0f9992bb1)
+        ;
+
+        
+    
+    
+            var marker_5908d4bce44cabf6dd168ad64d3d188c = L.marker(
+                [51.556, 2.9689],
+                {
+}
+            ).addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+        var popup_680eed8c70a01943b32eabd9b04fcb6a = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_8948c0dfaf1a607f7d6aea0562bc0ae6 = $(`<div id="html_8948c0dfaf1a607f7d6aea0562bc0ae6" style="width: 100.0%; height: 100.0%;">Thorntonbank - C-Power - Area NE</div>`)[0];
+                popup_680eed8c70a01943b32eabd9b04fcb6a.setContent(html_8948c0dfaf1a607f7d6aea0562bc0ae6);
+            
+        
+
+        marker_5908d4bce44cabf6dd168ad64d3d188c.bindPopup(popup_680eed8c70a01943b32eabd9b04fcb6a)
+        ;
+
+        
+    
+    
+            var marker_c8674460591f74125a95379ae5c9ed62 = L.marker(
+                [51.54, 2.921],
+                {
+}
+            ).addTo(map_f129badc733c305bf82d556ffe0d2778);
+        
+    
+        var popup_4f9574a120249357300d3bf0806bb717 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_db15102d3cc7c1edc477925df0582ce8 = $(`<div id="html_db15102d3cc7c1edc477925df0582ce8" style="width: 100.0%; height: 100.0%;">Thorntonbank - C-Power - Area SW</div>`)[0];
+                popup_4f9574a120249357300d3bf0806bb717.setContent(html_db15102d3cc7c1edc477925df0582ce8);
+            
+        
+
+        marker_c8674460591f74125a95379ae5c9ed62.bindPopup(popup_4f9574a120249357300d3bf0806bb717)
+        ;
+
+        
+    
+</script>
+</html>
