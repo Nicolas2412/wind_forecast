@@ -18,11 +18,11 @@ Arguments
                     "all"   → Tune puis réentraîne
     --model         Modèle(s) ciblé(s) — s'applique à tous les modes :
                     random_forest | lightgbm | xgboost | all  (défaut : all)
-    --eval_point    Nombre de points récents réservés pour l'évaluation finale
-                    (défaut : 720, soit ~30 jours horaires)
+    --train_percent Pourcentage du dataset à inclure dans l'ensemble de train (80% par défaut)
     --n_trials      Nombre d'essais Optuna par modèle (défaut : 50)
     --output_dir    Dossier de sortie pour les modèles sérialisés (défaut : models/)
     --site          Nom d'un site pour créer un modèle spécialisé sur un site (défaut : all)
+                    all_indiv permet l'entraînement de modèles spécialisé pour tous les sites
 """
 
 import argparse
@@ -31,6 +31,7 @@ import logging
 import time
 import warnings
 from pathlib import Path
+import os
 
 import joblib
 import numpy as np
@@ -62,6 +63,10 @@ log = logging.getLogger(__name__)
 N_SPLITS = 5          # folds TimeSeriesSplit
 EARLY_STOPPING = 50   # rounds sans amélioration (LightGBM / XGBoost)
 RANDOM_STATE = 42
+SITE_LIST = ['Norther Offshore WP', 'Northwind', 'Belwind Phase 1', 'Northwester 2',
+            'Thorntonbank - C-Power - Area NE', 'Mermaid Offshore WP',
+            'Seastar Offshore WP', 'Nobelwind Offshore Windpark',
+            'Thorntonbank - C-Power - Area SW', 'Rentel Offshore WP']
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +297,7 @@ def suggest_params(trial: optuna.Trial, model_type: str) -> dict:
 
     if model_type == "lightgbm":
         return {
-            "n_estimators":      trial.suggest_int("n_estimators", 50, 1000, step=50),
+            "n_estimators":      trial.suggest_int("n_estimators", 100, 3000, step=50),
             "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
             "num_leaves":        trial.suggest_int("num_leaves", 31, 255),
             "min_child_samples": trial.suggest_int("min_child_samples", 20, 200),
@@ -305,7 +310,7 @@ def suggest_params(trial: optuna.Trial, model_type: str) -> dict:
 
     if model_type == "xgboost":
         return {
-            "n_estimators":    trial.suggest_int("n_estimators", 50, 1000, step=50),
+            "n_estimators":    trial.suggest_int("n_estimators", 100, 3000, step=50),
             "learning_rate":   trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
             "max_depth":       trial.suggest_int("max_depth", 3, 10),
             "min_child_weight":trial.suggest_int("min_child_weight", 1, 50),
@@ -466,13 +471,13 @@ def train_final(
 
     # Évaluation hold-out
     y_pred = model.predict(X_eval)
-    eval_mae = float(mean_absolute_error(y_eval, y_pred))
-    log.info(f"[{model_type}] MAE hold-out = {eval_mae:.4f}")
+    test_mae = float(mean_absolute_error(y_eval, y_pred))
+    log.info(f"[{model_type}] MAE hold-out = {test_mae:.4f}")
 
     metrics = {
         "cv_mae":      round(cv_mae, 6),
         "cv_std":      round(cv_std, 6),
-        "eval_mae":    round(eval_mae, 6),
+        "test_mae":    round(test_mae, 6),
         "best_params": params,
     }
     return model, metrics
@@ -556,16 +561,29 @@ def run_pipeline(args):
 
     # --- 2. Split temporel train / eval ---
     step("Split train/eval")
-    df = df.sort_values("delivery_time").reset_index(drop=True)
-    eval_point = args.eval_point
-    df_train = df.iloc[:-eval_point]
-    df_eval  = df.iloc[-eval_point:]
+    time_col = processor.time_column
+    t_min = df[time_col].min()
+    t_max = df[time_col].max()
+    total_duration = t_max - t_min
+
+    # Derniers 20% du temps → test, reste → train/val en CV
+    t_test_start = t_min + total_duration * args.train_percent
+
+    df_train = df[df[time_col] < t_test_start].copy()
+    df_test = df[df[time_col] >= t_test_start].copy()
+
+    print(
+        f"Période train : {df_train[time_col].min()}  →  {df_train[time_col].max()}")
+    print(
+        f"Période test  : {df_test[time_col].min()}  →  {df_test[time_col].max()}")
+
+    
     X_train, y_train = prepare_Xy(df_train)
-    X_eval,  y_eval  = prepare_Xy(df_eval)
+    X_eval,  y_eval  = prepare_Xy(df_test)
     feature_names = list(X_train.columns)
     log.info(
         f"Train : {len(df_train):,} lignes | "
-        f"Eval  : {len(df_eval):,} lignes | "
+        f"Eval  : {len(df_test):,} lignes | "
         f"Features : {len(feature_names)}"
     )
     pipeline_bar.update(1)
@@ -677,12 +695,13 @@ def run_pipeline(args):
         log.info("-" * 50)
         for mt, m in all_metrics.items():
             log.info(
-                f"{mt:<20} {m['cv_mae']:>10.4f} {m['cv_std']:>8.4f} {m['eval_mae']:>10.4f}"
+                f"{mt:<20} {m['cv_mae']:>10.4f} {m['cv_std']:>8.4f} {m['test_mae']:>10.4f}"
             )
         log.info(f"\nDurée totale : {elapsed:.0f}s")
         log.info("=" * 60)
 
-        summary_path = output_dir / "summary.json"
+        end_path = "summary_" + args.model + ".json"
+        summary_path = output_dir / end_path
         summary_path.write_text(json.dumps(all_metrics, indent=2))
         log.info(f"Résumé complet → {summary_path}")
 
@@ -711,8 +730,8 @@ def parse_args():
         help="Modèle(s) ciblé(s), s'applique à tous les modes (défaut : all)",
     )
     parser.add_argument(
-        "--eval_point", type=int, default=720,
-        help="Nombre de points récents pour le hold-out final (défaut : 720 = ~30j)",
+        "--train_percent", type=float, default=0.8,
+        help="Pourcentage du dataset à inclure dans l'ensemble de train (80% par défaut)",
     )
     parser.add_argument(
         "--n_trials", type=int, default=50,
@@ -731,5 +750,14 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    print(args.site)
-    run_pipeline(args)
+    if args.site == "all_indiv":
+        for site in SITE_LIST:
+            site_args = argparse.Namespace(data_folder=args.data_folder,
+                                      mode=args.mode,
+                                      model=args.model,
+                                      train_percent=args.train_percent,
+                                      n_trials=args.n_trials,
+                                      output_dir=os.path.join(args.output_dir, site),
+                                      site= site,
+                                      )
+            run_pipeline(site_args)
