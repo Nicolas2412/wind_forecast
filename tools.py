@@ -151,8 +151,8 @@ def _build_lstm_net(input_size: int, hidden_size: int, num_layers: int, dropout:
                     # Orthogonal pour le récurrent (maintient la norme du gradient)
                     nn.init.orthogonal_(param.data)
                 elif 'bias' in name:
-                    # On met les biais à 0, sauf parfois le biais de la porte d'oubli
-                    param.data.fill_(0)
+                    n = param.size(0)
+                    param.data[n//4: n//2].fill_(1.0)  # forget gate bias = 1
         elif isinstance(m, nn.Linear):
             # Xavier pour la couche de sortie
             nn.init.xavier_uniform_(m.weight)
@@ -300,7 +300,9 @@ class DataProcessor:
         df[self.time_column] = pd.to_datetime(df[self.time_column])
         df["hour"]        = df[self.time_column].dt.hour
         df["day_of_week"] = df[self.time_column].dt.dayofweek
-        df["month"]       = df[self.time_column].dt.month
+        df["month"] = df[self.time_column].dt.month
+        df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
+        df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
         df["is_weekend"]  = (df["day_of_week"] >= 5).astype(int)
         df["is_night"]    = ((df["hour"] < 6) | (df["hour"] >= 22)).astype(int)
         df["hour_sin"]    = np.sin(2 * np.pi * df["hour"] / 24)
@@ -471,27 +473,30 @@ class ForecastModel:
         self.SARIMAX_SEAS_ORDER = (1, 1, 1, 24)
         self.SARIMAX_ENFORCE_STATIONARITY = False
         self.SARIMAX_ENFORCE_INVERTIBILITY = False
-        self.LSTM_SEQ_LEN = 48
+        self.LSTM_SEQ_LEN = 24
         self.LSTM_HIDDEN = 128
         self.LSTM_LAYERS = 2
-        self.LSTM_DROPOUT = 0.2
+        self.LSTM_DROPOUT = 0.4
         self.TRANSFORMER_SEQ_LEN = 48
         self.TRANSFORMER_D_MODEL = 64
         self.TRANSFORMER_NHEAD = 4
         self.TRANSFORMER_LAYERS = 2
         self.TRANSFORMER_DROPOUT = 0.1
-        self.DL_EPOCHS = 30
+        self.DL_EPOCHS = 20
+        #LSTM Optimums for (for p=10) (to use if cv desactivated): 
+        # All-Sites ~20 maybe more: ,
+        # s0: 69, s1: , s2:
+        # s3: , s4: , s5:
+        # s6: , s7: , s8:
+        # s9: 
         self.DL_BATCH_SIZE = 256
         self.DL_LR = 5e-5
         self.DL_GRAD_CLIP = 1.0
+        self.DL_PATIENCE = 10
         # self._apply_model_params_from_config()
         self.model          = None          # built lazily or at train time
         self.scaler_X       = None          # used by LSTM / Transformer
         self.scaler_y       = None          # used by LSTM / Transformer
-        self.evaluation_results: dict = {}
-        self.savepath = savepath
-        
-        
         self.evaluation_results: dict = {}
         self.savepath = savepath
         
@@ -527,15 +532,15 @@ class ForecastModel:
     # Public API
     # ------------------------------------------------------------------
 
-    def train(self, df: pd.DataFrame) -> None:
+    def train(self, df: pd.DataFrame, no_cv: bool = False) -> None:
         """Train with time-series cross-validation, then refit on full data."""
         dispatch = {
             "random_forest": self._train_sklearn,
             "xgboost":       self._train_sklearn,
             "lightgbm":      self._train_sklearn,
             "sarimax":       self._train_sarimax,
-            "lstm":          self._train_deep,
-            "transformer":   self._train_deep,
+            "lstm": lambda df: self._train_deep(df, no_cv=no_cv),
+            "transformer": lambda df: self._train_deep(df, no_cv=no_cv),
         }
         dispatch[self.model_type](df)
 
@@ -616,12 +621,17 @@ class ForecastModel:
 
                 s_mae = float(mean_absolute_error(site_true, site_pred))
                 s_rmse = float(np.sqrt(mean_squared_error(site_true, site_pred)))
-                
+                s_mean_y = np.mean(site_true)
+                s_nrmse = float(
+                    s_rmse / s_mean_y) if s_mean_y != 0 else 0.0  # Ajout ici
+
+
                 results["per_site_metrics"][site] = {
                     "mae": s_mae,
-                    "rmse": s_rmse
+                    "rmse": s_rmse,
+                    "nrmse": s_nrmse  # Ajout ici
                 }
-                
+                                
                 
                 # Plot individuel
                 ax = plt.subplot(n_rows, n_cols, i + 1)
@@ -704,12 +714,18 @@ class ForecastModel:
                 )))
                 portfolio_rmse_per_site = portfolio_rmse_total / n_sites
 
-            # Mise à jour du dictionnaire avec TOUTES les métriques
+                mean_portfolio_y = np.mean(full_portfolio_data['total_true'])
+
+
+                portfolio_nrmse_total = float(
+                    portfolio_rmse_total / mean_portfolio_y) if mean_portfolio_y != 0 else 0.0
+
             results.update({
                 "portfolio_mae_total": portfolio_mae_total,
                 "portfolio_mae_per_site": portfolio_mae_per_site,
                 "portfolio_rmse_total": portfolio_rmse_total,
                 "portfolio_rmse_per_site": portfolio_rmse_per_site,
+                "portfolio_nrmse_total": portfolio_nrmse_total,  # Ajout ici
                 "n_sites": n_sites
             })
             
@@ -777,12 +793,15 @@ class ForecastModel:
             
         if self.model_type in ("lstm", "transformer"):
             import torch
-            checkpoint = torch.load( load_path, map_location=torch.device('cpu'), weights_only=False)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            checkpoint = torch.load(load_path, map_location=device,
+                                    weights_only=False)  # 👈 en premier
             self.input_size = checkpoint['input_size']
             self.scaler_X = checkpoint['scaler_X']
             self.scaler_y = checkpoint['scaler_y']
             self.model = self._build_dl_model(self.input_size)
             self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.to(device)
         elif self.model_type == "sarimax":
             import statsmodels.api as sm
             self.model = sm.load(load_path)
@@ -999,12 +1018,41 @@ class ForecastModel:
             X_site_raw = grp[feat_cols].values.astype(np.float32)
             y_site_raw = grp[self.predict_column].values.astype(
                 np.float32).reshape(-1, 1)
+            
+            cols_to_scale = [
+                c for c in feat_cols if not c.endswith(('sin', 'cos'))]
+            idx_to_scale = [feat_cols.index(c) for c in cols_to_scale]
+            idx_no_scale = [feat_cols.index(c)
+                            for c in feat_cols if c.endswith(('sin', 'cos'))]
 
             # 2. Application du scaling (fit à l'extérieur, transform ici)
-            X_site_sc = scaler_X.transform(X_site_raw)
+            X_sc_part = scaler_X.transform(X_site_raw[:, idx_to_scale])
+            X_sc_part = np.clip(X_sc_part, -5.0, 5.0)
+            
+            X_site_sc = np.zeros_like(X_site_raw)
+            X_site_sc[:, idx_to_scale] = X_sc_part
+            X_site_sc[:, idx_no_scale] = X_site_raw[:, idx_no_scale]
+            
+            is_clipped = np.abs(X_site_sc) > 5.0
+            pct_clipped_global = np.mean(is_clipped) * 100
+
+            if pct_clipped_global > 1.0:
+                print(
+                    f"  ⚠️ [{site}] {pct_clipped_global:.2f}% des valeurs globales clippées. Détails :")
+                # On calcule le pourcentage de clipping spécifiquement pour chaque colonne
+                pct_per_feature = np.mean(is_clipped, axis=0) * 100
+
+                for i, col_name in enumerate(feat_cols):
+                    # Affiche toute variable qui subit un clipping
+                    if pct_per_feature[i] > 0.0:
+                        print(
+                            f"      -> {col_name} : {pct_per_feature[i]:.2f}% clippé")
+
+            
             X_site_sc = np.clip(X_site_sc, -5.0, 5.0) #Pour etre sur de pas avoir de valeur aberantes
             y_site_sc = scaler_y.transform(y_site_raw).ravel()
-
+            
+            
             # 3. Fenêtrage glissante
             for i in range(len(X_site_sc) - seq_len):
                 all_X.append(X_site_sc[i: i + seq_len])
@@ -1015,11 +1063,15 @@ class ForecastModel:
 
         return np.array(all_X), np.array(all_y)
 
-    def _train_deep(self, df: pd.DataFrame):
+    def _train_deep(self, df: pd.DataFrame, no_cv=False):
         import copy
         import torch
         import torch.nn as nn
         from torch.utils.data import TensorDataset, DataLoader
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[{self.model_type}] Utilisation de : {device}")
+
 
         feat_cols = [c for c in df.columns if c not in (
             self.time_column,
@@ -1027,152 +1079,216 @@ class ForecastModel:
             'site_name'
         )]
         print(f"Feat cols:  {feat_cols}")
-
+        
         params = self._get_dl_params()
         seq_len = params["seq_len"]
         # Need to keep unique times in distinct splits (each site has a row for each time)
         unique_times = np.sort(df[self.time_column].unique())
         tscv = TimeSeriesSplit(n_splits=self.n_splits)
 
-        # ------------------------------------------------------------------ #
-        #  Phase 1 : Cross-validation                                         #
-        #  But : estimer la perf + calibrer le nombre d'epochs pour le refit  #
-        # ------------------------------------------------------------------ #
-        fold_maes, fold_best_epochs = [], []
+        print(f"NO CV: {no_cv}")
+        if not no_cv:
+            # ------------------------------------------------------------------ #
+            #  Phase 1 : Cross-validation                                         #
+            #  But : estimer la perf + calibrer le nombre d'epochs pour le refit  #
+            # ------------------------------------------------------------------ #
+            fold_maes, fold_best_epochs = [], []
 
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(unique_times)):
-            print(f"\n--- Cross validation Fold {fold+1}/{self.n_splits} ---")
+            for fold, (train_idx, val_idx) in enumerate(tscv.split(unique_times)):
+                print(f"\n--- Cross validation Fold {fold+1}/{self.n_splits} ---")
 
-            # --- A. DÉFINITION DES PÉRIODES (DATES) ---
-            train_dates = unique_times[train_idx]
-            val_dates = unique_times[val_idx]
-            # Contexte : les seq_len heures juste avant la validation
-            if val_idx[0] < seq_len:
-                print(
-                    f"   [fold {fold+1}] Pas assez d'historique, fold ignoré.")
-                continue
-            ctx_dates = unique_times[val_idx[0] - seq_len: val_idx[0]]
+                # --- A. DÉFINITION DES PÉRIODES (DATES) ---
+                train_dates = unique_times[train_idx]
+                val_dates = unique_times[val_idx]
+                # Contexte : les seq_len heures juste avant la validation
+                if val_idx[0] < seq_len:
+                    print(
+                        f"   [fold {fold+1}] Pas assez d'historique, fold ignoré.")
+                    continue
+                ctx_dates = unique_times[val_idx[0] - seq_len: val_idx[0]]
 
-            # --- B. EXTRACTION DES MASQUES ---
-            df_train = df[df[self.time_column].isin(train_dates)]
-            df_val_raw = df[df[self.time_column].isin(val_dates)]
-            df_ctx = df[df[self.time_column].isin(ctx_dates)]
+                # --- B. EXTRACTION DES MASQUES ---
+                df_train = df[df[self.time_column].isin(train_dates)]
+                df_val_raw = df[df[self.time_column].isin(val_dates)]
+                df_ctx = df[df[self.time_column].isin(ctx_dates)]
 
-            # --- C. SCALERS (Fit sur Train uniquement) ---
-            # On utilise _to_arrays juste pour avoir les chiffres bruts pour le scaler
-            X_tr_raw, y_tr_raw, _ = self._to_arrays(df_train, feat_cols, self.predict_column)
-            
-            scaler_X_fold = StandardScaler().fit(X_tr_raw)
-            scaler_y_fold = MinMaxScaler(feature_range=(0, 1)).fit(y_tr_raw.reshape(-1, 1))
+                # --- C. SCALERS (Fit sur Train uniquement) ---
+                # On utilise _to_arrays juste pour avoir les chiffres bruts pour le scaler
+                X_tr_raw, y_tr_raw, _ = self._to_arrays(
+                    df_train, feat_cols, self.predict_column)
 
-            # --- D. GÉNÉRATION DES SÉQUENCES (Le moment de vérité) ---
-            X_tr_seq, y_tr_seq = self._prepare_sequences(
-                df_train, feat_cols, scaler_X_fold, scaler_y_fold, seq_len)
 
-            # Pour la val, on colle le contexte
-            df_val_with_ctx = pd.concat([df_ctx, df_val_raw])
-            X_val_seq, y_val_seq = self._prepare_sequences(
-                df_val_with_ctx, feat_cols, scaler_X_fold, scaler_y_fold, seq_len)
+                # On isole les index des colonnes à scaler
+                idx_to_scale = [i for i, c in enumerate(
+                    feat_cols) if not c.endswith(('sin', 'cos'))]
 
-            # --- LES PRINTS CRITIQUES ---
-            print(f"   Dates Train : {train_dates[0]} au {train_dates[-1]}")
-            print(f"   Lignes Train brutes : {len(df_train)}")
-            print(f"   Séquences LSTM Train: {X_tr_seq.shape[0]}")
-            print(f"   Séquences LSTM Val  : {X_val_seq.shape[0]}")
-
-            if len(X_tr_seq) == 0:
-                continue
-
-            # Modèle frais pour chaque fold
-            net = self._build_dl_model(X_tr_seq.shape[2])
-            opt = torch.optim.Adam(net.parameters(), lr=self.DL_LR)
-            loss_fn = nn.MSELoss()
-            
-            print(f"DEBUG SCALING - Fold {fold+1}")
-            print(
-                f"X_tr_seq MIN: {X_tr_seq.min():.2f} | MAX: {X_tr_seq.max():.2f} | MEAN: {X_tr_seq.mean():.2f}")
-            
-            train_loader = DataLoader(
-                TensorDataset(torch.from_numpy(X_tr_seq),
-                            torch.from_numpy(y_tr_seq)),
-                batch_size=params["batch"], shuffle=True,
-            )
-            val_loader = DataLoader(
-                TensorDataset(torch.from_numpy(X_val_seq),
-                            torch.from_numpy(y_val_seq)),
-                batch_size=params["batch"], shuffle=False,
-            )
-
-            best_val_loss = float("inf")
-            best_epoch = 0
-            patience_cnt = 0
-            patience = getattr(self, "DL_PATIENCE", 20)
-            grad_clip = getattr(self, "DL_GRAD_CLIP", 1.0)
-
-            print(f"patience: {patience}")
-            print(f"grad clip: {grad_clip}")
-            pbar = tqdm(range(1, params["epochs"] + 1), desc=f"Fold {fold+1}")
-            for epoch in pbar:
-                train_loss = 0.0
-                net.train()
-                for xb, yb in train_loader:
-                    opt.zero_grad()
-                    loss = loss_fn(net(xb), yb)
-                    loss.backward()
-                    if grad_clip > 0:
-                        nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
-                    opt.step()
-                    train_loss += loss.item()
-                train_loss /= len(train_loader)
-                net.eval()
-                val_loss = 0.0
-                with torch.no_grad():
-                    for xb, yb in val_loader:
-                        val_loss += loss_fn(net(xb), yb).item()
-                val_loss /= len(val_loader) 
-
-                pbar.set_postfix({"tr_loss": f"{train_loss:.4f}", "val_loss": f"{val_loss:.4f}", "best": best_epoch})
+                # On fitte le scaler UNIQUEMENT sur ces colonnes
+                scaler_X_fold = StandardScaler().fit(X_tr_raw[:, idx_to_scale])
                 
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_epoch = epoch
-                    # On voit l'époque qui gagne
-                    pbar.set_description(f"Fold {fold+1} (Best: {epoch})")
-                    pbar.refresh()
-                    pbar.set_postfix(
-                        {"tr_loss": f"{train_loss:.4f}", "val_loss": f"{val_loss:.4f}", "best": best_epoch})
-                    pbar.refresh()
-                    patience_cnt = 0
-                else:
-                    patience_cnt += 1
-                    if patience_cnt >= patience:
-                        break
+                scaler_y_fold = MinMaxScaler(feature_range=(0, 1)).fit(y_tr_raw.reshape(-1, 1))
 
-            # MAE en unités originales
-            net.eval()
-            with torch.no_grad():
-                preds_sc = net(torch.from_numpy(X_val_seq)).numpy()
-            preds = scaler_y_fold.inverse_transform(
-                preds_sc.reshape(-1, 1)).ravel()
-            truth = scaler_y_fold.inverse_transform(
-                y_val_seq.reshape(-1, 1)).ravel()
-            fold_mae = float(mean_absolute_error(truth, preds))
+                # --- D. GÉNÉRATION DES SÉQUENCES (Le moment de vérité) ---
+                X_tr_seq, y_tr_seq = self._prepare_sequences(
+                    df_train, feat_cols, scaler_X_fold, scaler_y_fold, seq_len)
 
-            fold_maes.append(fold_mae)
-            fold_best_epochs.append(best_epoch)
-            print(f"  [{self.model_type}] fold {fold+1} | MAE: {fold_mae:.4f} | best epoch: {best_epoch}")
+                # Pour la val, on colle le contexte
+                df_val_with_ctx = pd.concat([df_ctx, df_val_raw])
+                X_val_seq, y_val_seq = self._prepare_sequences(
+                    df_val_with_ctx, feat_cols, scaler_X_fold, scaler_y_fold, seq_len)
 
-        cv_mae = float(np.mean(fold_maes)) if fold_maes else float("nan")
-        # Médiane des best epochs — plus robuste que la moyenne aux folds extrêmes
-        refit_epochs = int(np.median(fold_best_epochs)) if fold_best_epochs else params["epochs"]
-        print(f"\n[{self.model_type}] CV MAE: {cv_mae:.4f} ± {np.std(fold_maes):.4f}")
-        print(f"[{self.model_type}] Refit sur {refit_epochs} epochs (médiane des best epochs par fold)")
+                # --- LES PRINTS CRITIQUES ---
+                print(f"   Dates Train : {train_dates[0]} au {train_dates[-1]}")
+                print(f"   Lignes Train brutes : {len(df_train)}")
+                print(f"   Séquences LSTM Train: {X_tr_seq.shape[0]}")
+                print(f"   Séquences LSTM Val  : {X_val_seq.shape[0]}")
 
-        self.evaluation_results = {
-            "cv_mae":      cv_mae,
-            "cv_mae_std":  float(np.std(fold_maes)),
-            "refit_epochs": refit_epochs,
-        }
+                if len(X_tr_seq) == 0:
+                    continue
+
+                # Modèle frais pour chaque fold
+                net = self._build_dl_model(X_tr_seq.shape[2]).to(device)
+                opt = torch.optim.Adam(
+                    net.parameters(), lr=self.DL_LR, weight_decay=1e-5)
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    opt, mode='min', patience=5, factor=0.5, min_lr=1e-6
+                )
+                loss_fn = nn.MSELoss()
+                
+                print(f"DEBUG SCALING - Fold {fold+1}")
+                print(
+                    f"X_tr_seq MIN: {X_tr_seq.min():.2f} | MAX: {X_tr_seq.max():.2f} | MEAN: {X_tr_seq.mean():.2f}")
+                
+                train_loader = DataLoader(
+                    TensorDataset(torch.from_numpy(X_tr_seq),
+                                torch.from_numpy(y_tr_seq)),
+                    batch_size=params["batch"], shuffle=True,
+                )
+                val_loader = DataLoader(
+                    TensorDataset(torch.from_numpy(X_val_seq),
+                                torch.from_numpy(y_val_seq)),
+                    batch_size=params["batch"], shuffle=False,
+                )
+
+                best_val_loss = float("inf")
+                best_epoch = 0
+                patience_cnt = 0
+                best_state = None
+                patience = getattr(self, "DL_PATIENCE", 20)
+                grad_clip = getattr(self, "DL_GRAD_CLIP", 1.0)
+
+                print(f"patience: {patience}")
+                print(f"grad clip: {grad_clip}")
+                pbar = tqdm(range(1, params["epochs"] + 1), desc=f"Fold {fold+1}")
+                for epoch in pbar:
+                    train_loss = 0.0
+
+                    train_preds_list = []
+                    train_true_list = []
+                    net.train()
+                    for xb, yb in train_loader:
+                        xb, yb = xb.to(device), yb.to(device)
+                        opt.zero_grad()
+                        pred = net(xb)
+                        loss = loss_fn(pred, yb)
+                        loss.backward()
+                        if grad_clip > 0:
+                            nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
+                        opt.step()
+                        train_loss += loss.item()
+
+                        train_preds_list.append(pred.detach().cpu().numpy())
+                        train_true_list.append(yb.cpu().numpy())
+                        
+                    train_loss /= len(train_loader)
+
+                    train_preds_all = scaler_y_fold.inverse_transform(
+                        np.concatenate(train_preds_list).reshape(-1, 1)).ravel()
+                    train_true_all = scaler_y_fold.inverse_transform(
+                        np.concatenate(train_true_list).reshape(-1, 1)).ravel()
+                    tr_mae = mean_absolute_error(train_true_all, train_preds_all)
+                    
+                    net.eval()
+                    val_loss = 0.0
+                    val_preds_list = []
+                    val_true_list = []
+
+                    with torch.no_grad():
+                        for xb, yb in val_loader:
+                            xb, yb = xb.to(device), yb.to(device)
+                            pred = net(xb)
+                            val_loss += loss_fn(pred, yb).item()
+                            val_preds_list.append(pred.cpu().numpy())
+                            val_true_list.append(yb.cpu().numpy())
+                    val_loss /= len(val_loader) 
+                    val_preds_all = scaler_y_fold.inverse_transform(
+                        np.concatenate(val_preds_list).reshape(-1, 1)).ravel()
+                    val_true_all = scaler_y_fold.inverse_transform(
+                        np.concatenate(val_true_list).reshape(-1, 1)).ravel()
+                    val_mae = mean_absolute_error(val_true_all, val_preds_all)
+                    scheduler.step(val_loss)
+                    
+                    
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_epoch = epoch
+                        best_state = copy.deepcopy(net.state_dict())
+                        # On voit l'époque qui gagne
+                        pbar.set_description(f"Fold {fold+1} (Best: {epoch})")
+                        pbar.refresh()
+                        pbar.set_postfix({
+                            "tr_loss": f"{train_loss:.4f}",
+                            "val_loss": f"{val_loss:.4f}",
+                            "tr_mae": f"{tr_mae:.4f}",
+                            "val_mae": f"{val_mae:.4f}",
+                            "best": best_epoch
+                        })
+
+                        pbar.refresh()
+                        patience_cnt = 0
+                    else:
+                        patience_cnt += 1
+                        if patience_cnt >= patience:
+                            break
+
+                # Loading the best model for this fold to evaluate on the val set
+                if best_state is not None:
+                    net.load_state_dict(best_state)
+                net.eval()
+                preds_chunks = []
+                with torch.no_grad():
+
+                    for i in range(0, len(X_val_seq), params["batch"]):
+                        chunk = torch.from_numpy(X_val_seq[i:i+params["batch"]]).to(device)
+                        preds_chunks.append(net(chunk).cpu().numpy())
+                        preds_sc = np.concatenate(preds_chunks)
+
+                preds = scaler_y_fold.inverse_transform(
+                    preds_sc.reshape(-1, 1)).ravel()
+                truth = scaler_y_fold.inverse_transform(
+                    y_val_seq.reshape(-1, 1)).ravel()
+                fold_mae = float(mean_absolute_error(truth, preds))
+
+                fold_maes.append(fold_mae)
+                fold_best_epochs.append(best_epoch)
+                print(f"  [{self.model_type}] fold {fold+1} | MAE: {fold_mae:.4f} | best epoch: {best_epoch}")
+
+            cv_mae = float(np.mean(fold_maes)) if fold_maes else float("nan")
+            # Médiane des best epochs — plus robuste que la moyenne aux folds extrêmes
+            refit_epochs = refit_epochs = int(np.median(fold_best_epochs[-3:])) if fold_best_epochs else params["epochs"]
+            print(f"\n[{self.model_type}] CV MAE: {cv_mae:.4f} ± {np.std(fold_maes):.4f}")
+            print(f"[{self.model_type}] Refit sur {refit_epochs} epochs (médiane des best epochs par fold)")
+
+            self.evaluation_results = {
+                "cv_mae":      cv_mae,
+                "cv_mae_std":  float(np.std(fold_maes)),
+                "refit_epochs": refit_epochs,
+            }
+        
+        else:
+            refit_epochs = self.DL_EPOCHS
+            self.evaluation_results = {"cv_mae": float(
+                "nan"), "cv_mae_std": float("nan"), "refit_epochs": refit_epochs}
+            print(f"[{self.model_type}] CV désactivé, refit sur {refit_epochs} epochs")
 
 
         # ------------------------------------------------------------------ #
@@ -1181,11 +1297,17 @@ class ForecastModel:
         # ------------------------------------------------------------------ #
         # On fitte sur TOUT le train brut
         X_raw, y_raw, _ = self._to_arrays(df, feat_cols, self.predict_column)
-        
+
+
         if not self.scaler_X or not self.scaler_y:
             raise ValueError("Scalers where not defined properly")
-        
-        self.scaler_X.fit(X_raw)
+
+        # On isole à nouveau les index
+        idx_to_scale = [i for i, c in enumerate(
+            feat_cols) if not c.endswith(('sin', 'cos'))]
+
+        # On fitte le scaler global UNIQUEMENT sur ces colonnes
+        self.scaler_X.fit(X_raw[:, idx_to_scale])
         self.scaler_y.fit(y_raw.reshape(-1, 1))
 
         # ON REUTILISE LA MÊME FONCTION
@@ -1194,8 +1316,12 @@ class ForecastModel:
         )
 
         self.input_size = X_seq.shape[2]
-        self.model = self._build_dl_model(self.input_size)
-        opt = torch.optim.Adam(self.model.parameters(), lr=self.DL_LR)
+        self.model = self._build_dl_model(self.input_size).to(device)
+        opt = torch.optim.Adam(self.model.parameters(),
+                               lr=self.DL_LR, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode='min', patience=5, factor=0.5, min_lr=1e-6
+        )
         loss_fn = nn.MSELoss()
         grad_clip = getattr(self, "DL_GRAD_CLIP", 1.0)
 
@@ -1204,7 +1330,12 @@ class ForecastModel:
 
         loader = DataLoader(
             TensorDataset(torch.from_numpy(X_seq), torch.from_numpy(y_seq)),
-            batch_size=params["batch"], shuffle=True,
+            batch_size=params["batch"], 
+            shuffle=True,
+            num_workers=4,      # parallélise le chargement
+            pin_memory=True,    # accélère le transfert CPU→GPU si GPU dispo
+            persistent_workers=True  # évite de recréer les workers à chaque epoch
+            
         )
 
         loss_history = {"train": [], "eval": []}
@@ -1212,26 +1343,39 @@ class ForecastModel:
         self.model.train()
         for epoch in tqdm(range(1, refit_epochs + 1)):
             epoch_loss = 0.0
-            for xb, yb in loader:
+            preds_list = []
+            true_list = []
+            for xb, yb in tqdm(loader, desc=f"  epoch {epoch}", leave=False):
+                xb, yb = xb.to(device), yb.to(device)
                 opt.zero_grad()
-                loss = loss_fn(self.model(xb), yb)
+                pred = self.model(xb)
+                loss = loss_fn(pred, yb)
                 loss.backward()
                 if grad_clip > 0:
                     nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                 opt.step()
                 epoch_loss += loss.item()
+                preds_list.append(pred.detach().cpu().numpy())
+                true_list.append(yb.cpu().numpy())
             avg_loss = epoch_loss / len(loader)
+            scheduler.step(avg_loss)
             loss_history["train"].append(avg_loss)
 
-            if epoch % 5 == 0 or epoch == refit_epochs:
-                print(
-                    f"  [refit] epoch {epoch}/{refit_epochs} | loss: {avg_loss:.6f}")
+            tr_preds = self.scaler_y.inverse_transform(
+                np.concatenate(preds_list).reshape(-1, 1)).ravel()
+            tr_true = self.scaler_y.inverse_transform(
+                np.concatenate(true_list).reshape(-1, 1)).ravel()
+            tr_mae = mean_absolute_error(tr_true, tr_preds)
+            print(
+                f"  [refit] epoch {epoch}/{refit_epochs} | loss: {avg_loss:.6f} | MAE train: {tr_mae:.4f}")
+
         print('end')
         # Pas de val loss pendant le refit — on n'a pas de set de val dédié
         return loss_history
 
     def _predict_deep(self, df: pd.DataFrame) -> np.ndarray:
         import torch
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         params = self._get_dl_params()
         seq_len = params["seq_len"]
 
@@ -1241,7 +1385,7 @@ class ForecastModel:
             self.predict_column,
             'site_name'
         )]
-        # print(feat_cols)
+        print(feat_cols)
         # 2. On utilise notre nouvelle fonction unique !
         # On passe le DF complet. Le scaler_X et scaler_y (fittés au train) sont utilisés.
         # On n'a pas besoin de y réels pour prédire, donc prepare_sequences s'en moque.
@@ -1254,9 +1398,13 @@ class ForecastModel:
             return np.array([])
 
         self.model.eval()
+        self.model.to(device)
+        preds_chunks = []
         with torch.no_grad():
-            # Conversion en tenseur et prédiction
-            preds_sc = self.model(torch.from_numpy(X_seq)).numpy()
+            for i in range(0, len(X_seq), 256):
+                chunk = torch.from_numpy(X_seq[i:i+256]).to(device)
+                preds_chunks.append(self.model(chunk).cpu().numpy())
+        preds_sc = np.concatenate(preds_chunks)
 
         # 4. Retour à l'échelle originale
         preds = self.scaler_y.inverse_transform(

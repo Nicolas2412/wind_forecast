@@ -9,20 +9,34 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
         one_site_only: bool = False,
         idx_site:int = 0,
         savepath:str = None,
-        drop_prod:bool = False):
+        drop_prod:bool = False,
+        no_cv:bool = False):
     
     path_folder = "data/"
     drop_colomns = ["production",
                     "installed_capacity",
                     "wind_speed_ratio", # valeurs explosives
                     "snowfall",
-                    'wind_direction_100m', 'wind_direction_10m', 'weather_code']
+                    "shortwave_radiation", "direct_radiation", "diffuse_radiation", "sunshine_duration",
+                    "dewpoint_2m", "apparent_temperature",
+                    'wind_direction_100m', 'wind_direction_10m', 'weather_code',
+                    "cloud_cover_low", "cloud_cover_mid", "cloud_cover_high",
+                    "is_weekend", "is_night", 'hour', 'day_of_week', 'month']
     if drop_prod:
         drop_colomns += ['production_lag360h', 'production_lag384h', 'production_lag720h', 'production_rolling_mean_7d',
                         'production_rolling_std_7d', 'production_rolling_mean_14d', 'production_rolling_std_14d',
                         ]
     processor = DataProcessor(path_folder, drop_columns=drop_colomns)
     df = processor.run()
+    
+    site_list = df['site_name'].unique()
+
+
+    # for i, name in enumerate(site_list):
+    #     print(f"  {i}: {name}")
+        
+    # return
+    
     
     print("> Application du clipping physique sur les features...")
 
@@ -81,7 +95,7 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
         print(f"Starting to train ({model_type})...")
         df_train_ready = processor.finalize_for_model(df_train)
         print(f"Using columns (production_normalized is the target): {df_train_ready.columns.tolist()}")
-        forecastModel.train(df_train_ready)
+        forecastModel.train(df_train_ready, no_cv=no_cv)
         forecastModel.save()
     else:
         print(f"[{model_type}] Modèle chargé avec succès. On saute l'entraînement.")
@@ -92,34 +106,38 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
     df_test_ready = processor.finalize_for_model(df_test)
     eval_results = forecastModel.evaluate(df_test_ready, plot=False)
 
-    print("\n" + "="*75)
-    print(f"{'SITE / GROUPE':<35} | {'MAE':<12} | {'RMSE':<12}")
-    print("-" * 75)
+    print("\n" + "="*85)
+    print(f"{'SITE / GROUPE':<35} | {'MAE':<10} | {'RMSE':<10} | {'nRMSE (%)':<10}")
+    print("-" * 85)
 
     # 1. Sites individuels triés par MAE
     per_site = eval_results.get("per_site_metrics", {})
     sorted_sites = sorted(per_site.items(), key=lambda x: x[1]['mae'])
 
     for site, metrics in sorted_sites:
+        # On multiplie par 100 pour afficher le nRMSE en vrai pourcentage
+        nrmse_pct = metrics.get('nrmse', 0) * 100
         print(
-            f"{site:<35} | {metrics['mae']:<12.4f} | {metrics['rmse']:<12.4f}")
+            f"{site:<35} | {metrics['mae']:<10.4f} | {metrics['rmse']:<10.4f} | {nrmse_pct:<10.2f}%")
 
-    print("-" * 75)
+    print("-" * 85)
 
-    # 2. Métriques Globales (Moyenne des points)
+    # 2. Métriques Globales
+    eval_nrmse_pct = eval_results.get('eval_nrmse', 0) * 100
     print(
-        f"{'MOYENNE GLOBALE':<35} | {eval_results['eval_mae']:<12.4f} | {eval_results['eval_rmse']:<12.4f}")
+        f"{'MOYENNE GLOBALE':<35} | {eval_results['eval_mae']:<10.4f} | {eval_results['eval_rmse']:<10.4f} | {eval_nrmse_pct:<10.2f}%")
 
-    # 3. Métriques Portefeuille (Somme)
+    # 3. Métriques Portefeuille
     p_mae_total = eval_results.get('portfolio_mae_total', 0)
     p_rmse_total = eval_results.get('portfolio_rmse_total', 0)
+    p_nrmse_total = eval_results.get('portfolio_nrmse_total', 0) * 100
 
     p_mae_site = eval_results.get('portfolio_mae_per_site', 0)
     p_rmse_site = eval_results.get('portfolio_rmse_per_site', 0)
 
-    print(f"{'PORTEFEUILLE (Somme)':<35} | {p_mae_total:<12.4f} | {p_rmse_total:<12.4f} | Somme brute")
-    print(f"{'PORTEFEUILLE (Moy/Site)':<35} | {p_mae_site:<12.4f} | {p_rmse_site:<12.4f} | Gain Foisonnement")
-    print("="*65 + "\n")
+    print(f"{'PORTEFEUILLE (Somme)':<35} | {p_mae_total:<10.4f} | {p_rmse_total:<10.4f} | {p_nrmse_total:<10.2f}%")
+    print(f"{'PORTEFEUILLE (Moy/Site)':<35} | {p_mae_site:<10.4f} | {p_rmse_site:<10.4f} | Gain Foisonnement")
+    print("="*85 + "\n")
 
 
 if __name__ == "__main__":
@@ -142,6 +160,10 @@ if __name__ == "__main__":
     parser.add_argument("-dp", "--drop_prod",
                         action="store_true",
                         help="Desactive l'utilisation des features liées à la production")
+    
+    parser.add_argument("--no_cv",
+                        action="store_true",
+                        help="Saute la cross validation")
 
 
     parser.add_argument("-s", "--site_index",
@@ -154,7 +176,13 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    base_dir = f"data/models/{args.model}"
+    if args.unique_site:
+        print(f"MODE SITE UNIQUE ACTIVÉ - Site index: {args.site_index}")
+        subfolder = f"site_{args.site_index}"
+    else:
+        print("MODE TOUS SITES ACTIVÉ")
+        subfolder = "all_sites"
+    base_dir = f"data/models/{args.model}/{subfolder}"
     savepath = os.path.join(base_dir, f"{args.name}.pkl")
 
     # On s'assure que le dossier existe (évite une erreur au moment du save)
@@ -176,4 +204,5 @@ if __name__ == "__main__":
         one_site_only=args.unique_site,
         idx_site=args.site_index,
         savepath=savepath,
-        drop_prod=args.drop_prod)
+        drop_prod=args.drop_prod,
+        no_cv=args.no_cv)
