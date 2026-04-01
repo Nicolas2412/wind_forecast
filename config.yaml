@@ -31,20 +31,20 @@ model_params:
     enforce_invertibility: false
 
   lstm:
-    seq_len: 48
+    seq_len: 168
     hidden_size: 128
     num_layers: 2
-    dropout: 0.2
-    epochs: 30
+    dropout: 0.3
+    epochs: 50
     batch_size: 256
-    learning_rate: 0.001
+    learning_rate: 0.00005
 
   transformer:
-    seq_len: 48
-    d_model: 64
-    nhead: 4
-    num_layers: 2
-    dropout: 0.1
-    epochs: 30
+    seq_len: 8
+    d_model: 128
+    nhead: 8
+    num_layers: 3
+    dropout: 0.2
+    epochs: 50
     batch_size: 256
-    learning_rate: 0.001
+    learning_rate: 0.0001

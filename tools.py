@@ -167,13 +167,30 @@ def _build_lstm_net(input_size: int, hidden_size: int, num_layers: int, dropout:
 def _build_transformer_net(input_size: int, d_model: int, nhead: int,
                             num_layers: int, dropout: float):
     """Build a PyTorch Transformer regressor."""
+    import math
     import torch
     import torch.nn as nn
+
+    class PositionalEncoding(nn.Module):
+        def __init__(self, d_model: int, max_len: int = 5000):
+            super().__init__()
+            position = torch.arange(max_len).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+            pe = torch.zeros(max_len, d_model)
+            pe[:, 0::2] = torch.sin(position * div_term)
+            pe[:, 1::2] = torch.cos(position * div_term)
+            self.register_buffer('pe', pe.unsqueeze(0))
+
+        def forward(self, x):
+            x = x + self.pe[:, :x.size(1), :]
+            return x
 
     class _TransformerNet(nn.Module):
         def __init__(self):
             super().__init__()
             self.input_proj = nn.Linear(input_size, d_model)
+            self.pos_encoder = PositionalEncoding(d_model)
+            self.dropout = nn.Dropout(dropout)
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=d_model, nhead=nhead, dropout=dropout,
                 dim_feedforward=d_model * 4, batch_first=True,
@@ -183,6 +200,8 @@ def _build_transformer_net(input_size: int, d_model: int, nhead: int,
 
         def forward(self, x):                       # x: (B, T, F)
             x = self.input_proj(x)                  # (B, T, d_model)
+            x = self.pos_encoder(x)
+            x = self.dropout(x)
             x = self.encoder(x)                     # (B, T, d_model)
             x = x[:, -1, :]                         # last timestep (B, d_model)
             return self.fc(x).squeeze(-1)            # (B,)
@@ -254,34 +273,25 @@ class DataProcessor:
     def impute_production(self, df: pd.DataFrame, max_gap_hours: int = 6) -> pd.DataFrame:
         results = []
         for site, grp in df.groupby("site_name"):
-            # On s'assure que le temps est bien au format datetime
             grp[self.time_column] = pd.to_datetime(grp[self.time_column])
             grp = grp.sort_values(self.time_column).copy()
 
-            # 1. Plateaux → NaN
             if "is_not_plateau" in grp.columns:
                 grp.loc[~grp["is_not_plateau"], "production_normalized"] = np.nan
 
-            # --- FIX ICI ---
-            # On passe la colonne temporelle en index pour permettre l'interpolation "time"
             grp = grp.set_index(self.time_column)
 
-            # 2. Interpolation temporelle
             grp["production_normalized"] = (
                 grp["production_normalized"]
                 .interpolate(method="time", limit=max_gap_hours)
             )
 
-            # On repasse en index numérique pour la suite des opérations (fillna, etc.)
             grp = grp.reset_index()
-            # ---------------
 
-            # 3. Trous longs résiduels → médiane du site
             site_median = grp["production_normalized"].median()
             grp["production_normalized"] = grp["production_normalized"].fillna(
                 site_median)
 
-            # 4. ffill/bfill pour les bords
             grp["production_normalized"] = (
                 grp["production_normalized"].ffill().bfill()
             )
@@ -325,43 +335,32 @@ class DataProcessor:
         v100 = df["wind_speed_100m"].clip(lower=0.5)
         df["wind_shear_alpha"] = np.log(v100 / v10) / np.log(100 / 10)
         
-        min_lag_h = data_delay_days * 24   # 360h pour 15 jours
+        min_lag_h = data_delay_days * 24
         
         results = []
         for site, grp in df.groupby("site_name"):
             grp = grp.set_index(self.time_column).sort_index()
 
-            # --- Grille horaire complète (corrige les trous de maintenance) ---
-            # Pas sur que ca soit utile comme on le fait avant de retirer les plateaux
             full_idx = pd.date_range(grp.index.min(), grp.index.max(), freq="1h", tz="UTC")
             grp = grp.reindex(full_idx)
             grp["site_name"] = site
 
-            # --- Lags causaux (>= data_delay_days * 24h) ---
-            # lag_360h : même heure, J-15 — premier lag disponible
             grp[f"production_lag{min_lag_h}h"] = grp["production_normalized"].shift(
                 min_lag_h)
-            # lag_384h : même heure, J-16
             grp[f"production_lag{min_lag_h + 24}h"] = grp["production_normalized"].shift(
                 min_lag_h + 24)
-            # lag_720h : même heure, J-30 (capture la saisonnalité mensuelle)
             grp["production_lag720h"] = grp["production_normalized"].shift(720)
 
-            # --- Statistiques glissantes causales ---
-            # On shifte d'abord de min_lag_h pour que la fenêtre commence à J-15
             shifted = grp["production_normalized"].shift(min_lag_h)
-            # Fenêtre 7 jours (168h) sur [J-15, J-22]
             grp["production_rolling_mean_7d"] = shifted.rolling(
                 168, min_periods=84).mean()
             grp["production_rolling_std_7d"] = shifted.rolling(
                 168, min_periods=84).std()
-            # Fenêtre 14 jours (336h) sur [J-15, J-29]
             grp["production_rolling_mean_14d"] = shifted.rolling(
                 336, min_periods=168).mean()
             grp["production_rolling_std_14d"] = shifted.rolling(
                 336, min_periods=168).std()
 
-            # --- Suppression des lignes de maintenance APRÈS calcul des lags ---
             if "is_not_plateau" in grp.columns:
                 grp = grp[grp["is_not_plateau"].fillna(False)]
 
@@ -398,19 +397,12 @@ class DataProcessor:
         return df
     
     def finalize_for_model(self, df):
-        # 1. On définit ce qu'on veut exclure
-        # Note: J'ajoute "site_name" ici si tu ne le veux pas dans le modèle final
         to_exclude = self.drop_columns
 
-        # 2. On identifie les colonnes à GARDER (features + cible)
-        # On s'assure de ne garder que ce qui existe réellement dans le df
         cols_to_keep = [c for c in df.columns if c not in to_exclude]
 
-        # 3. Création du masque de lignes (on vérifie les NaN sur les colonnes conservées)
-        # On vérifie que TOUTES les colonnes gardées sont non-nulles sur la ligne
         mask = df[cols_to_keep].notna().all(axis=1)
 
-        # 4. On filtre les LIGNES avec le masque ET les COLONNES avec cols_to_keep
         df_final = df.loc[mask, cols_to_keep]
 
         return df_final
@@ -461,7 +453,8 @@ class ForecastModel:
         random_forest | xgboost | lightgbm | sarimax | lstm | transformer
     """
 
-    def __init__(self, model_type: str = DEFAULT_MODEL_TYPE, savepath:str = None):
+    def __init__(self, model_type: str = DEFAULT_MODEL_TYPE, savepath:str = None, verbose:bool = False):
+        self.verbose        = verbose
         self.time_column    = "delivery_time"
         self.predict_column = "production_normalized"
         self.n_splits       = 5
@@ -483,17 +476,10 @@ class ForecastModel:
         self.TRANSFORMER_LAYERS = 2
         self.TRANSFORMER_DROPOUT = 0.1
         self.DL_EPOCHS = 20
-        #LSTM Optimums for (for p=10) (to use if cv desactivated): 
-        # All-Sites ~20 maybe more: ,
-        # s0: 69, s1: , s2:
-        # s3: , s4: , s5:
-        # s6: , s7: , s8:
-        # s9: 
         self.DL_BATCH_SIZE = 256
         self.DL_LR = 5e-5
         self.DL_GRAD_CLIP = 1.0
         self.DL_PATIENCE = 10
-        # self._apply_model_params_from_config()
         self.model          = None          # built lazily or at train time
         self.scaler_X       = None          # used by LSTM / Transformer
         self.scaler_y       = None          # used by LSTM / Transformer
@@ -553,7 +539,7 @@ class ForecastModel:
         if df is not None:
             if self.model_type in ['lstm', 'transformer']:
                 prediction, y_true = self._predict_deep(df)
-                seq_len = self.LSTM_SEQ_LEN
+                seq_len = self._get_dl_params()["seq_len"]
             else:
                 prediction = self.predict(df)
                 y_true = df[self.predict_column].to_numpy()
@@ -592,8 +578,6 @@ class ForecastModel:
             fig.suptitle(f"Évaluation Multi-Sites (300 dernières heures): Modèle {self.model_type.upper()}\nMAE Global: {mae:.4f} | RMSE Global: {rmse:.4f}",
                         fontsize=18, fontweight='bold', y=0.98)
             for i, site in enumerate(site_names):
-                # Calcul de la longueur attendue pour ce site
-                # (Nombre de lignes du site - seq_len)
                 site_data = df[df['site_name'] == site]
                 site_data_len = len(df[df['site_name'] == site])
                 n_seq = site_data_len - seq_len
@@ -601,22 +585,18 @@ class ForecastModel:
                 if n_seq <= 0:
                     continue
 
-                # Extraction des segments
                 site_pred = prediction[current_idx: current_idx + n_seq]
                 site_true = y_true[current_idx: current_idx + n_seq]
                 
                 site_dates = pd.to_datetime(
                     site_data[self.time_column].iloc[seq_len:].values)
 
-                # 2. On crée un DataFrame temporaire pour ce site
                 temp_site = pd.DataFrame({
                     'total_true': site_true.flatten(),
                     'total_pred': site_pred.flatten(),
                     'count': 1
                 }, index=site_dates)
 
-                # 3. On ajoute au global en utilisant l'index pour aligner
-                # On utilise add() avec fill_value=0 pour gérer les dates manquantes
                 sum_df = sum_df.add(temp_site, fill_value=0)
 
                 s_mae = float(mean_absolute_error(site_true, site_pred))
@@ -700,14 +680,12 @@ class ForecastModel:
             portfolio_rmse_per_site = 0.0
 
             if len(full_portfolio_data) > 0:
-                # MAE
                 portfolio_mae_total = float(mean_absolute_error(
                     full_portfolio_data['total_true'],
                     full_portfolio_data['total_pred']
                 ))
                 portfolio_mae_per_site = portfolio_mae_total / n_sites
 
-                # RMSE (La partie manquante)
                 portfolio_rmse_total = float(np.sqrt(mean_squared_error(
                     full_portfolio_data['total_true'],
                     full_portfolio_data['total_pred']
@@ -889,14 +867,23 @@ class ForecastModel:
     # ------------------------------------------------------------------
 
     def _train_sklearn(self, df: pd.DataFrame) -> None:
-        X = df.drop(columns=[self.time_column, self.predict_column])
-        y = df[self.predict_column]
-
         tscv = TimeSeriesSplit(n_splits=self.n_splits)
         maes = []
-        for train_idx, val_idx in tscv.split(X):
-            X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        
+        unique_times = np.sort(df[self.time_column].unique())
+        
+        for train_idx, val_idx in tscv.split(unique_times):
+            train_dates = unique_times[train_idx]
+            val_dates = unique_times[val_idx]
+            
+            df_tr = df[df[self.time_column].isin(train_dates)]
+            df_val = df[df[self.time_column].isin(val_dates)]
+            
+            X_tr = df_tr.drop(columns=[self.time_column, self.predict_column, 'site_name'], errors='ignore')
+            y_tr = df_tr[self.predict_column]
+            X_val = df_val.drop(columns=[self.time_column, self.predict_column, 'site_name'], errors='ignore')
+            y_val = df_val[self.predict_column]
+
             fold_model = clone(self.model)
             fold_model.fit(X_tr, y_tr)
             maes.append(mean_absolute_error(y_val, fold_model.predict(X_val)))
@@ -905,7 +892,9 @@ class ForecastModel:
         self.evaluation_results = {"cv_mae": cv_mae, "cv_mae_std": float(np.std(maes))}
         print(f"[{self.model_type}] CV MAE: {cv_mae:.4f} ± {np.std(maes):.4f}")
 
-        self.model.fit(X, y)
+        X_full = df.drop(columns=[self.time_column, self.predict_column, 'site_name'], errors='ignore')
+        y_full = df[self.predict_column]
+        self.model.fit(X_full, y_full)
 
     def _predict_sklearn(self, df: pd.DataFrame) -> np.ndarray:
         X = df.drop(columns=[self.time_column, self.predict_column], errors="ignore")
@@ -1009,12 +998,10 @@ class ForecastModel:
         """
         all_X, all_y = [], []
         
-        # On boucle par site pour ne JAMAIS mélanger la fin d'un site avec le début d'un autre
         for site, grp in df.groupby("site_name"):
             if len(grp) <= seq_len:
                 continue
 
-            # 1. Extraction des valeurs brutes pour ce site
             X_site_raw = grp[feat_cols].values.astype(np.float32)
             y_site_raw = grp[self.predict_column].values.astype(
                 np.float32).reshape(-1, 1)
@@ -1025,7 +1012,6 @@ class ForecastModel:
             idx_no_scale = [feat_cols.index(c)
                             for c in feat_cols if c.endswith(('sin', 'cos'))]
 
-            # 2. Application du scaling (fit à l'extérieur, transform ici)
             X_sc_part = scaler_X.transform(X_site_raw[:, idx_to_scale])
             X_sc_part = np.clip(X_sc_part, -5.0, 5.0)
             
@@ -1088,16 +1074,11 @@ class ForecastModel:
 
         print(f"NO CV: {no_cv}")
         if not no_cv:
-            # ------------------------------------------------------------------ #
-            #  Phase 1 : Cross-validation                                         #
-            #  But : estimer la perf + calibrer le nombre d'epochs pour le refit  #
-            # ------------------------------------------------------------------ #
             fold_maes, fold_best_epochs = [], []
 
             for fold, (train_idx, val_idx) in enumerate(tscv.split(unique_times)):
                 print(f"\n--- Cross validation Fold {fold+1}/{self.n_splits} ---")
 
-                # --- A. DÉFINITION DES PÉRIODES (DATES) ---
                 train_dates = unique_times[train_idx]
                 val_dates = unique_times[val_idx]
                 # Contexte : les seq_len heures juste avant la validation
@@ -1107,40 +1088,33 @@ class ForecastModel:
                     continue
                 ctx_dates = unique_times[val_idx[0] - seq_len: val_idx[0]]
 
-                # --- B. EXTRACTION DES MASQUES ---
                 df_train = df[df[self.time_column].isin(train_dates)]
                 df_val_raw = df[df[self.time_column].isin(val_dates)]
                 df_ctx = df[df[self.time_column].isin(ctx_dates)]
 
-                # --- C. SCALERS (Fit sur Train uniquement) ---
-                # On utilise _to_arrays juste pour avoir les chiffres bruts pour le scaler
                 X_tr_raw, y_tr_raw, _ = self._to_arrays(
                     df_train, feat_cols, self.predict_column)
 
 
-                # On isole les index des colonnes à scaler
                 idx_to_scale = [i for i, c in enumerate(
                     feat_cols) if not c.endswith(('sin', 'cos'))]
 
-                # On fitte le scaler UNIQUEMENT sur ces colonnes
                 scaler_X_fold = StandardScaler().fit(X_tr_raw[:, idx_to_scale])
                 
                 scaler_y_fold = MinMaxScaler(feature_range=(0, 1)).fit(y_tr_raw.reshape(-1, 1))
 
-                # --- D. GÉNÉRATION DES SÉQUENCES (Le moment de vérité) ---
                 X_tr_seq, y_tr_seq = self._prepare_sequences(
                     df_train, feat_cols, scaler_X_fold, scaler_y_fold, seq_len)
 
-                # Pour la val, on colle le contexte
                 df_val_with_ctx = pd.concat([df_ctx, df_val_raw])
                 X_val_seq, y_val_seq = self._prepare_sequences(
                     df_val_with_ctx, feat_cols, scaler_X_fold, scaler_y_fold, seq_len)
 
-                # --- LES PRINTS CRITIQUES ---
-                print(f"   Dates Train : {train_dates[0]} au {train_dates[-1]}")
-                print(f"   Lignes Train brutes : {len(df_train)}")
-                print(f"   Séquences LSTM Train: {X_tr_seq.shape[0]}")
-                print(f"   Séquences LSTM Val  : {X_val_seq.shape[0]}")
+                if self.verbose:
+                    print(f"   Dates Train : {train_dates[0]} au {train_dates[-1]}")
+                    print(f"   Lignes Train brutes : {len(df_train)}")
+                    print(f"   Séquences LSTM Train: {X_tr_seq.shape[0]}")
+                    print(f"   Séquences LSTM Val  : {X_val_seq.shape[0]}")
 
                 if len(X_tr_seq) == 0:
                     continue
@@ -1154,9 +1128,10 @@ class ForecastModel:
                 )
                 loss_fn = nn.MSELoss()
                 
-                print(f"DEBUG SCALING - Fold {fold+1}")
-                print(
-                    f"X_tr_seq MIN: {X_tr_seq.min():.2f} | MAX: {X_tr_seq.max():.2f} | MEAN: {X_tr_seq.mean():.2f}")
+                if self.verbose:      
+                    print(f"DEBUG SCALING - Fold {fold+1}")
+                    print(
+                        f"X_tr_seq MIN: {X_tr_seq.min():.2f} | MAX: {X_tr_seq.max():.2f} | MEAN: {X_tr_seq.mean():.2f}")
                 
                 train_loader = DataLoader(
                     TensorDataset(torch.from_numpy(X_tr_seq),
@@ -1176,9 +1151,10 @@ class ForecastModel:
                 patience = getattr(self, "DL_PATIENCE", 20)
                 grad_clip = getattr(self, "DL_GRAD_CLIP", 1.0)
 
-                print(f"patience: {patience}")
-                print(f"grad clip: {grad_clip}")
-                pbar = tqdm(range(1, params["epochs"] + 1), desc=f"Fold {fold+1}")
+                if self.verbose:
+                    print(f"patience: {patience}")
+                    print(f"grad clip: {grad_clip}")
+                pbar = tqdm(range(1, params["epochs"] + 1), desc=f"Fold {fold+1}", disable=not self.verbose)
                 for epoch in pbar:
                     train_loss = 0.0
 
@@ -1291,26 +1267,18 @@ class ForecastModel:
             print(f"[{self.model_type}] CV désactivé, refit sur {refit_epochs} epochs")
 
 
-        # ------------------------------------------------------------------ #
-        #  Phase 2 : Refit sur toutes les données train                       #
-        #  Scaler refitté sur tout le train, epochs = médiane des best epochs #
-        # ------------------------------------------------------------------ #
-        # On fitte sur TOUT le train brut
         X_raw, y_raw, _ = self._to_arrays(df, feat_cols, self.predict_column)
 
 
         if not self.scaler_X or not self.scaler_y:
             raise ValueError("Scalers where not defined properly")
 
-        # On isole à nouveau les index
         idx_to_scale = [i for i, c in enumerate(
             feat_cols) if not c.endswith(('sin', 'cos'))]
 
-        # On fitte le scaler global UNIQUEMENT sur ces colonnes
         self.scaler_X.fit(X_raw[:, idx_to_scale])
         self.scaler_y.fit(y_raw.reshape(-1, 1))
 
-        # ON REUTILISE LA MÊME FONCTION
         X_seq, y_seq = self._prepare_sequences(
             df, feat_cols, self.scaler_X, self.scaler_y, seq_len
         )
@@ -1341,11 +1309,11 @@ class ForecastModel:
         loss_history = {"train": [], "eval": []}
 
         self.model.train()
-        for epoch in tqdm(range(1, refit_epochs + 1)):
+        for epoch in tqdm(range(1, refit_epochs + 1), disable=not self.verbose):
             epoch_loss = 0.0
             preds_list = []
             true_list = []
-            for xb, yb in tqdm(loader, desc=f"  epoch {epoch}", leave=False):
+            for xb, yb in tqdm(loader, desc=f"  epoch {epoch}", leave=False, disable=not self.verbose):
                 xb, yb = xb.to(device), yb.to(device)
                 opt.zero_grad()
                 pred = self.model(xb)
@@ -1366,8 +1334,8 @@ class ForecastModel:
             tr_true = self.scaler_y.inverse_transform(
                 np.concatenate(true_list).reshape(-1, 1)).ravel()
             tr_mae = mean_absolute_error(tr_true, tr_preds)
-            print(
-                f"  [refit] epoch {epoch}/{refit_epochs} | loss: {avg_loss:.6f} | MAE train: {tr_mae:.4f}")
+            if self.verbose:
+                print(f"  [refit] epoch {epoch}/{refit_epochs} | loss: {avg_loss:.6f} | MAE train: {tr_mae:.4f}")
 
         print('end')
         # Pas de val loss pendant le refit — on n'a pas de set de val dédié
@@ -1379,21 +1347,16 @@ class ForecastModel:
         params = self._get_dl_params()
         seq_len = params["seq_len"]
 
-        # 1. On définit les colonnes de features (en excluant site_name du calcul mais pas du DF)
         feat_cols = [c for c in df.columns if c not in (
             self.time_column,
             self.predict_column,
             'site_name'
         )]
         print(feat_cols)
-        # 2. On utilise notre nouvelle fonction unique !
-        # On passe le DF complet. Le scaler_X et scaler_y (fittés au train) sont utilisés.
-        # On n'a pas besoin de y réels pour prédire, donc prepare_sequences s'en moque.
         X_seq, y_true_sc = self._prepare_sequences(
             df, feat_cols, self.scaler_X, self.scaler_y, seq_len
         )
 
-        # 3. Inférence PyTorch
         if len(X_seq) == 0:
             return np.array([])
 
@@ -1401,12 +1364,11 @@ class ForecastModel:
         self.model.to(device)
         preds_chunks = []
         with torch.no_grad():
-            for i in range(0, len(X_seq), 256):
-                chunk = torch.from_numpy(X_seq[i:i+256]).to(device)
+            for i in range(0, len(X_seq), 2048):
+                chunk = torch.from_numpy(X_seq[i:i+2048]).to(device)
                 preds_chunks.append(self.model(chunk).cpu().numpy())
         preds_sc = np.concatenate(preds_chunks)
 
-        # 4. Retour à l'échelle originale
         preds = self.scaler_y.inverse_transform(
         preds_sc.reshape(-1, 1)).ravel()
         y_true = self.scaler_y.inverse_transform(y_true_sc.reshape(-1, 1)).ravel()

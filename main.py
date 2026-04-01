@@ -10,7 +10,10 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
         idx_site:int = 0,
         savepath:str = None,
         drop_prod:bool = False,
-        no_cv:bool = False):
+        no_cv:bool = False,
+        skip_train:bool = False,
+        verbose:bool = False):
+
     
     path_folder = "data/"
     drop_colomns = ["production",
@@ -30,36 +33,22 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
     df = processor.run()
     
     site_list = df['site_name'].unique()
-
-
-    # for i, name in enumerate(site_list):
-    #     print(f"  {i}: {name}")
-        
-    # return
-    
     
     print("> Application du clipping physique sur les features...")
 
-    # 1. Vent (On limite à 45 m/s, ce qui est déjà énorme)
     wind_cols = [
         c for c in df.columns if 'wind_speed' in c or 'wind_gusts' in c]
     df[wind_cols] = df[wind_cols].clip(lower=0, upper=45)
-
-    # 2. Puissance théorique et Lags (On évite les valeurs délirantes)
-    # Si ta production est normalisée (0-1), 5 est une marge de sécurité énorme
     if 'theoretical_power' in df.columns:
         df['theoretical_power'] = df['theoretical_power'].clip(
             lower=0, upper=5)
 
-    # 3. Wind Shear Alpha (Stabilité du ratio)
     if 'wind_shear_alpha' in df.columns:
-        # On remplace les infinis par 0 (pas de vent) avant de clipper
         df['wind_shear_alpha'] = df['wind_shear_alpha'].replace(
             [float('inf'), float('-inf')], 0).fillna(0)
         df['wind_shear_alpha'] = df['wind_shear_alpha'].clip(
             lower=-0.5, upper=1.0)
 
-    # Site selection
     if one_site_only:
         site_name = df['site_name'].unique()[idx_site]
         df = df[df['site_name'] == site_name]
@@ -73,7 +62,6 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
     t_max = df[time_col].max()
     total_duration = t_max - t_min
 
-    # Calcul du point de bascule selon le test_size
     t_test_start = t_min + total_duration * (1 - test_size)
 
     df_train = df[df[time_col] < t_test_start].copy()
@@ -89,9 +77,14 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
     print(f"------------------------------\n")
 
     # --- ENTRAINEMENT ---
-    forecastModel = ForecastModel(model_type=model_type, savepath=savepath)
+    forecastModel = ForecastModel(model_type=model_type, savepath=savepath, verbose=verbose)
 
-    if forecastModel.model is None:
+    if skip_train:
+        if forecastModel.model is None:
+            print(f"[{model_type}] --skip_train activé mais aucun modèle trouvé à {savepath}. Abandon.")
+            sys.exit(1)
+        print(f"[{model_type}] --skip_train activé. On passe directement à l'évaluation.")
+    elif forecastModel.model is None:
         print(f"Starting to train ({model_type})...")
         df_train_ready = processor.finalize_for_model(df_train)
         print(f"Using columns (production_normalized is the target): {df_train_ready.columns.tolist()}")
@@ -102,7 +95,6 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
     
     # --- EVALUATION ---
     print("Starting to evaluate...")
-    # On nettoie le test
     df_test_ready = processor.finalize_for_model(df_test)
     eval_results = forecastModel.evaluate(df_test_ready, plot=False)
 
@@ -110,24 +102,19 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
     print(f"{'SITE / GROUPE':<35} | {'MAE':<10} | {'RMSE':<10} | {'nRMSE (%)':<10}")
     print("-" * 85)
 
-    # 1. Sites individuels triés par MAE
     per_site = eval_results.get("per_site_metrics", {})
     sorted_sites = sorted(per_site.items(), key=lambda x: x[1]['mae'])
 
     for site, metrics in sorted_sites:
-        # On multiplie par 100 pour afficher le nRMSE en vrai pourcentage
         nrmse_pct = metrics.get('nrmse', 0) * 100
         print(
             f"{site:<35} | {metrics['mae']:<10.4f} | {metrics['rmse']:<10.4f} | {nrmse_pct:<10.2f}%")
 
     print("-" * 85)
 
-    # 2. Métriques Globales
     eval_nrmse_pct = eval_results.get('eval_nrmse', 0) * 100
     print(
         f"{'MOYENNE GLOBALE':<35} | {eval_results['eval_mae']:<10.4f} | {eval_results['eval_rmse']:<10.4f} | {eval_nrmse_pct:<10.2f}%")
-
-    # 3. Métriques Portefeuille
     p_mae_total = eval_results.get('portfolio_mae_total', 0)
     p_rmse_total = eval_results.get('portfolio_rmse_total', 0)
     p_nrmse_total = eval_results.get('portfolio_nrmse_total', 0) * 100
@@ -165,6 +152,14 @@ if __name__ == "__main__":
                         action="store_true",
                         help="Saute la cross validation")
 
+    parser.add_argument("--skip_train",
+                        action="store_true",
+                        help="Saute l'entraînement et passe directement à l'évaluation")
+                        
+    parser.add_argument("-v", "--verbose",
+                        action="store_true",
+                        help="Affiche les détails d'entrainement époque par époque")
+
 
     parser.add_argument("-s", "--site_index",
                         type=int,
@@ -185,10 +180,8 @@ if __name__ == "__main__":
     base_dir = f"data/models/{args.model}/{subfolder}"
     savepath = os.path.join(base_dir, f"{args.name}.pkl")
 
-    # On s'assure que le dossier existe (évite une erreur au moment du save)
     os.makedirs(base_dir, exist_ok=True)
     
-    # --- Vérification de l'existence ---
     if os.path.exists(savepath):
         response = input(
             f"Le modèle {savepath} existe déjà. Voulez-vous l'utiliser ? (y/n) : ")
@@ -198,11 +191,12 @@ if __name__ == "__main__":
     else:
         print(f"Nouveau modèle, il sera sauvegardé sous : {savepath}")
 
-    # --- Appel du main ---
     main(model_type=args.model,
         test_size=args.test_size,
         one_site_only=args.unique_site,
         idx_site=args.site_index,
         savepath=savepath,
         drop_prod=args.drop_prod,
-        no_cv=args.no_cv)
+        no_cv=args.no_cv,
+        skip_train=args.skip_train,
+        verbose=args.verbose)
