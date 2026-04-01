@@ -10,7 +10,8 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
         idx_site:int = 0,
         savepath:str = None,
         drop_prod:bool = False,
-        no_cv:bool = False):
+        no_cv:bool = False,
+        seq_len:int = 48):
     
     path_folder = "data/"
     drop_colomns = ["production",
@@ -28,15 +29,6 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
                         ]
     processor = DataProcessor(path_folder, drop_columns=drop_colomns)
     df = processor.run()
-    
-    site_list = df['site_name'].unique()
-
-
-    # for i, name in enumerate(site_list):
-    #     print(f"  {i}: {name}")
-        
-    # return
-    
     
     print("> Application du clipping physique sur les features...")
 
@@ -89,7 +81,7 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
     print(f"------------------------------\n")
 
     # --- ENTRAINEMENT ---
-    forecastModel = ForecastModel(model_type=model_type, savepath=savepath)
+    forecastModel = ForecastModel(model_type=model_type, savepath=savepath, seq_len=seq_len)
 
     if forecastModel.model is None:
         print(f"Starting to train ({model_type})...")
@@ -139,6 +131,18 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
     print(f"{'PORTEFEUILLE (Moy/Site)':<35} | {p_mae_site:<10.4f} | {p_rmse_site:<10.4f} | Gain Foisonnement")
     print("="*85 + "\n")
 
+    metrics = {
+        'eval_mae': eval_results['eval_mae'],
+        'eval_rmse': eval_results['eval_rmse'],
+        'eval_nrmse': eval_results['eval_nrmse'],
+        'portfolio_mae_total': eval_results.get('portfolio_mae_total', None),
+        'portfolio_rmse_total': eval_results.get('portfolio_rmse_total', None),
+        'portfolio_nrmse_total': eval_results.get('portfolio_nrmse_total', None),
+        'portfolio_mae_per_site': eval_results.get('portfolio_mae_per_site', None),
+        'portfolio_rmse_per_site': eval_results.get('portfolio_rmse_per_site', None)
+    }
+
+    return metrics
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run general model pipeline.")
@@ -174,6 +178,9 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--name", type=str, default="testModel",
                         help="Nom du fichier de sauvegarde (sans extension)")
     
+    parser.add_argument("--seq_len", type=int, default=48,
+                        help="Longueur de la séquence pour les modèles LSTM/Transformer")
+    
     args = parser.parse_args()
     
     if args.unique_site:
@@ -205,4 +212,5 @@ if __name__ == "__main__":
         idx_site=args.site_index,
         savepath=savepath,
         drop_prod=args.drop_prod,
-        no_cv=args.no_cv)
+        no_cv=args.no_cv,
+        seq_len=args.seq_len)

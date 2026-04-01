@@ -240,7 +240,7 @@ class DataProcessor:
                     window: str = "24h",
                     tolerance: float = 0.01,
                     low_thresh: float = 0.1,
-                    high_thresh: float = 0.9) -> pd.DataFrame:
+                    high_thresh: float = 0.90) -> pd.DataFrame:
 
         df = self.df.copy()
 
@@ -251,45 +251,87 @@ class DataProcessor:
         self.df = df
         return df
 
+    # def impute_production(self, df: pd.DataFrame, max_gap_hours: int = 6) -> pd.DataFrame:
+    #     results = []
+    #     for site, grp in df.groupby("site_name"):
+    #         # On s'assure que le temps est bien au format datetime
+    #         grp[self.time_column] = pd.to_datetime(grp[self.time_column])
+    #         grp = grp.sort_values(self.time_column).copy()
+
+    #         # 1. Plateaux → NaN
+    #         if "is_not_plateau" in grp.columns:
+    #             grp.loc[~grp["is_not_plateau"], "production_normalized"] = np.nan
+
+    #         # --- FIX ICI ---
+    #         # On passe la colonne temporelle en index pour permettre l'interpolation "time"
+    #         grp = grp.set_index(self.time_column)
+
+    #         # 2. Interpolation temporelle
+    #         grp["production_normalized"] = (
+    #             grp["production_normalized"]
+    #             .interpolate(method="time", limit=max_gap_hours)
+    #         )
+
+    #         # On repasse en index numérique pour la suite des opérations (fillna, etc.)
+    #         grp = grp.reset_index()
+    #         # ---------------
+
+    #         # 3. Trous longs résiduels → médiane du site
+    #         site_median = grp["production_normalized"].median()
+    #         grp["production_normalized"] = grp["production_normalized"].fillna(
+    #             site_median)
+
+    #         # 4. ffill/bfill pour les bords
+    #         grp["production_normalized"] = (
+    #             grp["production_normalized"].ffill().bfill()
+    #         )
+
+    #         results.append(grp)
+
+        # return pd.concat(results, ignore_index=True)
+    
     def impute_production(self, df: pd.DataFrame, max_gap_hours: int = 6) -> pd.DataFrame:
         results = []
         for site, grp in df.groupby("site_name"):
-            # On s'assure que le temps est bien au format datetime
-            grp[self.time_column] = pd.to_datetime(grp[self.time_column])
             grp = grp.sort_values(self.time_column).copy()
+            grp[self.time_column] = pd.to_datetime(grp[self.time_column])
 
             # 1. Plateaux → NaN
             if "is_not_plateau" in grp.columns:
                 grp.loc[~grp["is_not_plateau"], "production_normalized"] = np.nan
 
-            # --- FIX ICI ---
-            # On passe la colonne temporelle en index pour permettre l'interpolation "time"
+            # 2. Interpolation temporelle (On garde, c'est le top pour les petits trous)
             grp = grp.set_index(self.time_column)
-
-            # 2. Interpolation temporelle
-            grp["production_normalized"] = (
-                grp["production_normalized"]
-                .interpolate(method="time", limit=max_gap_hours)
+            grp["production_normalized"] = grp["production_normalized"].interpolate(
+                method="time", limit=max_gap_hours
             )
-
-            # On repasse en index numérique pour la suite des opérations (fillna, etc.)
             grp = grp.reset_index()
-            # ---------------
 
-            # 3. Trous longs résiduels → médiane du site
-            site_median = grp["production_normalized"].median()
-            grp["production_normalized"] = grp["production_normalized"].fillna(
-                site_median)
+            # Au lieu d'une médiane fixe, on utilise la moyenne par heure (0-23h)
+            if grp["production_normalized"].isnull().any():
+                # On crée une clé temporaire pour l'heure
+                grp['tmp_hour'] = grp[self.time_column].dt.hour
 
-            # 4. ffill/bfill pour les bords
-            grp["production_normalized"] = (
-                grp["production_normalized"].ffill().bfill()
-            )
+                # On calcule la moyenne de prod pour chaque heure sur ce site
+                hourly_map = grp.groupby('tmp_hour')[
+                    "production_normalized"].mean()
 
+                # Si une heure est totalement vide (rare), on met la médiane du site en secours
+                hourly_map = hourly_map.fillna(
+                    grp["production_normalized"].median())
+
+                # On remplit les NaNs en mappant l'heure sur nos moyennes
+                grp["production_normalized"] = grp["production_normalized"].fillna(
+                    grp['tmp_hour'].map(hourly_map)
+                )
+                grp = grp.drop(columns=['tmp_hour'])
+            # --------------------------------------------------
+
+            # 4. ffill/bfill pour les cas extrêmes (bords du dataset)
+            grp["production_normalized"] = grp["production_normalized"].ffill().bfill()
             results.append(grp)
 
         return pd.concat(results, ignore_index=True)
-    
     
     def engineer_features(self, df: pd.DataFrame, data_delay_days: int = 15) -> pd.DataFrame:
         """Engineer features for the model."""
@@ -461,7 +503,7 @@ class ForecastModel:
         random_forest | xgboost | lightgbm | sarimax | lstm | transformer
     """
 
-    def __init__(self, model_type: str = DEFAULT_MODEL_TYPE, savepath:str = None):
+    def __init__(self, model_type: str = DEFAULT_MODEL_TYPE, savepath:str = None, seq_len: int = 48):
         self.time_column    = "delivery_time"
         self.predict_column = "production_normalized"
         self.n_splits       = 5
@@ -473,7 +515,7 @@ class ForecastModel:
         self.SARIMAX_SEAS_ORDER = (1, 1, 1, 24)
         self.SARIMAX_ENFORCE_STATIONARITY = False
         self.SARIMAX_ENFORCE_INVERTIBILITY = False
-        self.LSTM_SEQ_LEN = 24
+        self.LSTM_SEQ_LEN = seq_len
         self.LSTM_HIDDEN = 128
         self.LSTM_LAYERS = 2
         self.LSTM_DROPOUT = 0.4
@@ -482,7 +524,7 @@ class ForecastModel:
         self.TRANSFORMER_NHEAD = 4
         self.TRANSFORMER_LAYERS = 2
         self.TRANSFORMER_DROPOUT = 0.1
-        self.DL_EPOCHS = 20
+        self.DL_EPOCHS = 1000
         #LSTM Optimums for (for p=10) (to use if cv desactivated): 
         # All-Sites ~20 maybe more: ,
         # s0: 69, s1: , s2:
@@ -1007,6 +1049,7 @@ class ForecastModel:
         """
         Scaling par site + Fenêtrage NumPy + Recollage global.
         """
+        print(seq_len)
         all_X, all_y = [], []
         
         # On boucle par site pour ne JAMAIS mélanger la fin d'un site avec le début d'un autre
@@ -1084,7 +1127,7 @@ class ForecastModel:
         seq_len = params["seq_len"]
         # Need to keep unique times in distinct splits (each site has a row for each time)
         unique_times = np.sort(df[self.time_column].unique())
-        tscv = TimeSeriesSplit(n_splits=self.n_splits)
+        tscv = TimeSeriesSplit(n_splits=self.n_splits, gap=seq_len)
 
         print(f"NO CV: {no_cv}")
         if not no_cv:
