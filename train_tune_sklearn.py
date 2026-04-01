@@ -540,22 +540,26 @@ def run_pipeline(args):
     # --- 1. Chargement et preprocessing via DataProcessor ---
     step("Chargement données")
     log.info("Chargement des données...")
+    # DataProcessor.run() enchaîne : prepocess_data → impute_production → engineer_features
     processor = DataProcessor(args.data_folder)
-    df = processor.prepocess_data()
+    df_raw = processor.run()
     pipeline_bar.update(1)
 
-    # Feature engineering corrigé pour day-ahead
+    # Feature engineering / finalisation
     step("Feature engineering")
-    log.info("Feature engineering day-ahead (grille horaire régulière)...")
-    df = engineer_features_dayahead(df)
+    log.info("Finalisation du dataset (suppression colonnes inutiles, NaN)...")
+
+    # Filtrage par site AVANT finalize_for_model — site_name est encore présent ici
     if args.site != "all":
         log.info(f"Filtrage du dataset pour le site : {args.site}")
-        df = df[df["site_name"] == args.site].copy()
-
-        if df.empty:
+        df_raw = df_raw[df_raw["site_name"] == args.site].copy()
+        if df_raw.empty:
             raise ValueError(f"Aucune donnée trouvée pour le site : {args.site}")
-    drop_always = ["production", "installed_capacity"]
-    df.drop(columns=[c for c in drop_always if c in df.columns], inplace=True)
+
+    # finalize_for_model supprime site_name, production, installed_capacity, is_not_plateau
+    # et filtre les lignes avec NaN résiduels
+    df = processor.finalize_for_model(df_raw)
+
     log.info(f"Dataset prêt : {len(df):,} lignes × {df.shape[1]} colonnes")
     pipeline_bar.update(1)
 

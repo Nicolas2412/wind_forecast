@@ -196,7 +196,7 @@ def _build_transformer_net(input_size: int, d_model: int, nhead: int,
 class DataProcessor:
     """Data Processing class."""
 
-    def __init__(self, path_folder: str, X: pd.DataFrame = None, drop_columns: list = ["site_name"]):
+    def __init__(self, path_folder: str, X: pd.DataFrame = None, drop_columns: list = []):
         self.path = path_folder
         self.time_column = "delivery_time"
         self.predict_column = "production_normalized"
@@ -361,7 +361,7 @@ class DataProcessor:
 
             # --- Suppression des lignes de maintenance APRÈS calcul des lags ---
             if "is_not_plateau" in grp.columns:
-                grp = grp[grp["is_not_plateau"].fillna(False)]
+                grp = grp[grp["is_not_plateau"].fillna(False).infer_objects(copy=False).astype(bool)]
 
             results.append(grp.reset_index().rename(columns={"index": self.time_column}))
 
@@ -391,7 +391,7 @@ class DataProcessor:
             # Puissance éolienne théorique ∝ ρ·v³ (avant coefficient de puissance Cp)
             df["theoretical_power"] = df["air_density"] * df["wind_speed_100m"] ** 3
         
-        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.replace([np.inf, -np.inf], np.nan).infer_objects(copy=False)
 
         return df
     
