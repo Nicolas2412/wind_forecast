@@ -351,11 +351,33 @@ def visualize_site_specific(model_type:str, models_folder:Path, data_folder:Path
 
 
 
+def viz_feature_importance(model_type, model_dir):
 
+    model_dir = Path(model_dir)
 
-visualize_site_specific("random_forest", "./models/nicolas_tools", "./data", no_lag=False)
-visualize_site_specific("random_forest", "./models/nicolas_tools_nolag", "./data", no_lag=True)
+    feature_names = json.loads((model_dir / f"{model_type}_features.json").read_text())
+    model      = joblib.load(model_dir / f"{model_type}_model.joblib")
 
+    if hasattr(model, "feature_importances_"):
+        importances = model.feature_importances_
+        top_n = 20
+        idx = np.argsort(importances)[-top_n:]
+
+        fig3, ax = plt.subplots(figsize=(10, 6))
+        ax.barh(
+            [feature_names[i] for i in idx],
+            importances[idx],
+            color='blue', alpha=0.8, edgecolor="white",
+        )
+        ax.set_xlabel("Importance")
+        ax.set_title(f"Top {top_n} features — {model_type}", fontsize=12, fontweight="bold")
+        plt.tight_layout()
+        # plt.savefig(MODEL_DIR / f"{MODEL_TYPE}_feature_importance.png", dpi=150, bbox_inches="tight")
+        plt.show()
+
+# visualize_site_specific("random_forest", "./models/nicolas_tools", "./data", no_lag=False)
+# visualize_site_specific("random_forest", "./models/nicolas_tools_nolag", "./data", no_lag=True)
+viz_feature_importance('lightgbm', 'models/nicolas_tools_nolag')
 
 
 
