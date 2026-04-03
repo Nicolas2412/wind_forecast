@@ -11,6 +11,7 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
         savepath:str = None,
         drop_prod:bool = False,
         no_cv:bool = False,
+        on_nine_sites : bool = False,
         skip_train:bool = False,
         verbose:bool = False):
 
@@ -53,6 +54,13 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
         site_name = df['site_name'].unique()[idx_site]
         df = df[df['site_name'] == site_name]
         print(f"> Using only site {site_name}")
+    elif on_nine_sites:
+        # Use the first 9 sites for training and the 10th for testing ( and one_site_only )
+        site_list = df['site_name'].unique()
+
+        train_sites = [s for i, s in enumerate(site_list) if i != idx_site]
+        test_site = site_list[idx_site]
+        print(f"> Using sites {', '.join(train_sites)} for training and {test_site} for testing")
     else:
         print(f"> Using all sites")
     
@@ -64,8 +72,14 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
 
     t_test_start = t_min + total_duration * (1 - test_size)
 
-    df_train = df[df[time_col] < t_test_start].copy()
-    df_test = df[df[time_col] >= t_test_start].copy()
+    if on_nine_sites:
+        train_mask = (df[time_col] < t_test_start) & (df['site_name'].isin(train_sites))
+        test_mask = (df[time_col] >= t_test_start) & (df['site_name'] == test_site)
+        df_train = df[train_mask].copy()
+        df_test = df[test_mask].copy()
+    else:
+        df_train = df[df[time_col] < t_test_start].copy()
+        df_test = df[df[time_col] >= t_test_start].copy()
 
     print(f"--- Configuration du Split ---")
     print(f"Période totale : {t_min} -> {t_max}")
@@ -75,6 +89,10 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
         f"Période test   : {df_test[time_col].min()} -> {df_test[time_col].max()}")
     print(f"Lignes -> train: {len(df_train)} | test: {len(df_test)}")
     print(f"------------------------------\n")
+
+    if df_train.empty or df_test.empty:
+        print("[split] Train or test dataframe is empty after preprocessing and site selection. Check the chosen site index and test size.")
+        sys.exit(1)
 
     # --- ENTRAINEMENT ---
     forecastModel = ForecastModel(model_type=model_type, savepath=savepath, verbose=verbose)
@@ -165,6 +183,9 @@ if __name__ == "__main__":
                         type=int,
                         default=0,
                         help="Indice du site à utiliser (cas only_one_site)")
+    parser.add_argument("--on_nine_sites",
+                        action="store_true",
+                        help="Active l'utilisation de 9 sites et 1 pour le test (en combinaison avec --unique_site)")
 
     parser.add_argument("-n", "--name", type=str, default="testModel",
                         help="Nom du fichier de sauvegarde (sans extension)")
@@ -199,4 +220,5 @@ if __name__ == "__main__":
         drop_prod=args.drop_prod,
         no_cv=args.no_cv,
         skip_train=args.skip_train,
+        on_nine_sites=args.on_nine_sites,
         verbose=args.verbose)

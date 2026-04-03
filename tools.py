@@ -485,6 +485,8 @@ class ForecastModel:
         self.scaler_y       = None          # used by LSTM / Transformer
         self.evaluation_results: dict = {}
         self.savepath = savepath
+
+        self._apply_model_params_from_config()
         
         if self.savepath:
             p = Path(self.savepath)
@@ -509,10 +511,6 @@ class ForecastModel:
             self.model = None 
             self.scaler_X = StandardScaler()
             self.scaler_y = MinMaxScaler(feature_range=(0, 1))
-            
-            # Initialisation légère pour les modèles tree-based
-            if self.model_type in ("random_forest", "xgboost", "lightgbm"):
-                self.model = self._build_sklearn_model()
                 
     # ------------------------------------------------------------------
     # Public API
@@ -867,6 +865,9 @@ class ForecastModel:
     # ------------------------------------------------------------------
 
     def _train_sklearn(self, df: pd.DataFrame) -> None:
+        if self.model is None:
+            self.model = self._build_sklearn_model()
+
         tscv = TimeSeriesSplit(n_splits=self.n_splits)
         maes = []
         
@@ -897,7 +898,9 @@ class ForecastModel:
         self.model.fit(X_full, y_full)
 
     def _predict_sklearn(self, df: pd.DataFrame) -> np.ndarray:
-        X = df.drop(columns=[self.time_column, self.predict_column], errors="ignore")
+        X = df.drop(columns=[self.time_column, self.predict_column, 'site_name'], errors="ignore")
+        if X.empty:
+            raise ValueError("No prediction features available after preprocessing.")
         return self.model.predict(X)
 
     # ------------------------------------------------------------------
