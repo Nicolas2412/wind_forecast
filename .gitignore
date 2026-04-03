@@ -2,5 +2,3 @@ data/
 .venv/
 __pycache__/
 *.pyc
-models
-Belwind1

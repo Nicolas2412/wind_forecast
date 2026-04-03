@@ -1,22 +1,25 @@
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from matplotlib import pyplot as plt
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from matplotlib import pyplot as plt
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Optional
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from copy import deepcopy
-from copy import deepcopy
-
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.base import clone
-from sklearn.preprocessing import StandardScaler
-from tqdm import tqdm
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
+from src.models import build_knn_model, build_lstm_net, build_transformer_net, build_tree_model
 
 DEFAULT_TEST_SIZE = 0.2
 
-SUPPORTED_MODELS = ["random_forest", "xgboost", "lightgbm", "sarimax", "lstm", "transformer"]
+SUPPORTED_MODELS = [
+    "random_forest",
+    "xgboost",
+    "lightgbm",
+    "knn",
+    "lstm",
+    "transformer",
+]
 
 DEFAULT_MODEL_PARAMS = {
     "random_forest": {
@@ -29,6 +32,7 @@ DEFAULT_MODEL_PARAMS = {
         "random_state": 42,
         "n_jobs": -1,
         "tree_method": "hist",
+        "verbosity": 0,
     },
     "lightgbm": {
         "n_estimators": 200,
@@ -36,11 +40,10 @@ DEFAULT_MODEL_PARAMS = {
         "n_jobs": -1,
         "verbose": -1,
     },
-    "sarimax": {
-        "order": [1, 1, 1],
-        "seasonal_order": [1, 1, 1, 24],
-        "enforce_stationarity": False,
-        "enforce_invertibility": False,
+    "knn": {
+        "n_neighbors": 25,
+        "weights": "distance",
+        "n_jobs": -1,
     },
     "lstm": {
         "seq_len": 48,
@@ -50,6 +53,10 @@ DEFAULT_MODEL_PARAMS = {
         "epochs": 30,
         "batch_size": 256,
         "learning_rate": 1e-3,
+        "weight_decay": 0.0,
+        "patience": 8,
+        "grad_clip": 0.0,
+        "val_fraction": 0.2,
     },
     "transformer": {
         "seq_len": 48,
@@ -60,26 +67,108 @@ DEFAULT_MODEL_PARAMS = {
         "epochs": 30,
         "batch_size": 256,
         "learning_rate": 1e-3,
+        "weight_decay": 0.0,
+        "patience": 8,
+        "grad_clip": 0.0,
+        "val_fraction": 0.2,
     },
 }
+
+DEFAULT_BACKBONE_CONFIG = {
+    "data": {
+        "folder": "data/",
+        "file_pattern": "dataset_*.parquet",
+        "exclude_files": ["dataset_2"],
+    },
+    "schema": {
+        "time_column": "delivery_time",
+        "group_column": "site_name",
+        "target_column": "production_normalized",
+        "raw_target_column": "production",
+        "capacity_column": "installed_capacity",
+    },
+    "preprocessing": {
+        "drop_columns": ["production", "installed_capacity", "is_not_plateau"],
+        "drop_prod_columns": [
+            "production_lag360h",
+            "production_lag384h",
+            "production_lag720h",
+            "production_rolling_mean_7d",
+            "production_rolling_std_7d",
+            "production_rolling_mean_14d",
+            "production_rolling_std_14d",
+        ],
+        "plateau": {
+            "enabled": True,
+            "N": 5,
+            "window": "24h",
+            "tolerance": 0.01,
+            "low_thresh": 0.1,
+            "high_thresh": 0.9,
+        },
+        "imputation": {
+            "enabled": True,
+            "max_gap_hours": 6,
+        },
+        "feature_engineering": {
+            "time_features": True,
+            "weather_features": True,
+            "lag_features": True,
+            "data_delay_days": 15,
+        },
+    },
+    "postprocess": {
+        "clip_rules": [
+            {
+                "contains_any": ["wind_speed", "wind_gusts"],
+                "lower": 0.0,
+                "upper": 45.0,
+            },
+            {
+                "columns": ["theoretical_power"],
+                "lower": 0.0,
+                "upper": 5.0,
+            },
+            {
+                "columns": ["wind_shear_alpha"],
+                "replace_inf_with": 0.0,
+                "fillna": 0.0,
+                "lower": -0.5,
+                "upper": 1.0,
+            },
+        ]
+    },
+}
+
+
+def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
 
 
 def _load_config(config_path: str = "config.yaml") -> dict:
     config_file = Path(config_path)
     if not config_file.is_absolute():
         config_file = Path(__file__).resolve().parent / config_file
+
     if not config_file.exists():
         return {
-            "valid_models": SUPPORTED_MODELS,
+            "valid_models": list(SUPPORTED_MODELS),
             "model_params": deepcopy(DEFAULT_MODEL_PARAMS),
+            "backbone": deepcopy(DEFAULT_BACKBONE_CONFIG),
         }
 
     try:
         import yaml
     except ImportError:
         return {
-            "valid_models": SUPPORTED_MODELS,
+            "valid_models": list(SUPPORTED_MODELS),
             "model_params": deepcopy(DEFAULT_MODEL_PARAMS),
+            "backbone": deepcopy(DEFAULT_BACKBONE_CONFIG),
         }
 
     try:
@@ -88,1543 +177,910 @@ def _load_config(config_path: str = "config.yaml") -> dict:
     except Exception:
         raw = {}
 
-    config_valid_models = raw.get("valid_models", SUPPORTED_MODELS)
-    valid_models = [
-        model_name
-        for model_name in config_valid_models
-        if model_name in SUPPORTED_MODELS
-    ]
+    raw_valid_models = raw.get("valid_models", SUPPORTED_MODELS)
+    valid_models = [name for name in raw_valid_models if name in SUPPORTED_MODELS]
     if not valid_models:
         valid_models = list(SUPPORTED_MODELS)
 
     model_params = deepcopy(DEFAULT_MODEL_PARAMS)
-    loaded_model_params = raw.get("model_params", {})
-    if isinstance(loaded_model_params, dict):
-        for model_name, params in loaded_model_params.items():
+    loaded_params = raw.get("model_params", {})
+    if isinstance(loaded_params, dict):
+        for model_name, params in loaded_params.items():
             if model_name in model_params and isinstance(params, dict):
                 model_params[model_name].update(params)
+
+    backbone = deepcopy(DEFAULT_BACKBONE_CONFIG)
+    loaded_backbone = raw.get("backbone", {})
+    if isinstance(loaded_backbone, dict):
+        _deep_update(backbone, loaded_backbone)
 
     return {
         "valid_models": valid_models,
         "model_params": model_params,
+        "backbone": backbone,
     }
 
 
 _APP_CONFIG = _load_config()
 VALID_MODELS = _APP_CONFIG["valid_models"]
 MODEL_PARAMS = _APP_CONFIG["model_params"]
-DEFAULT_MODEL_TYPE = VALID_MODELS[0]
-from tqdm import tqdm
-
-DEFAULT_TEST_SIZE = 0.2
-
-SUPPORTED_MODELS = ["random_forest", "xgboost", "lightgbm", "sarimax", "lstm", "transformer"]
-
-DEFAULT_MODEL_PARAMS = {
-    "random_forest": {
-        "n_estimators": 200,
-        "random_state": 42,
-        "n_jobs": -1,
-    },
-    "xgboost": {
-        "n_estimators": 200,
-        "random_state": 42,
-        "n_jobs": -1,
-        "tree_method": "hist",
-    },
-    "lightgbm": {
-        "n_estimators": 200,
-        "random_state": 42,
-        "n_jobs": -1,
-        "verbose": -1,
-    },
-    "sarimax": {
-        "order": [1, 1, 1],
-        "seasonal_order": [1, 1, 1, 24],
-        "enforce_stationarity": False,
-        "enforce_invertibility": False,
-    },
-    "lstm": {
-        "seq_len": 48,
-        "hidden_size": 128,
-        "num_layers": 2,
-        "dropout": 0.2,
-        "epochs": 30,
-        "batch_size": 256,
-        "learning_rate": 1e-3,
-    },
-    "transformer": {
-        "seq_len": 48,
-        "d_model": 64,
-        "nhead": 4,
-        "num_layers": 2,
-        "dropout": 0.1,
-        "epochs": 30,
-        "batch_size": 256,
-        "learning_rate": 1e-3,
-    },
-}
-
-
-def _load_config(config_path: str = "config.yaml") -> dict:
-    config_file = Path(config_path)
-    if not config_file.is_absolute():
-        config_file = Path(__file__).resolve().parent / config_file
-    if not config_file.exists():
-        return {
-            "valid_models": SUPPORTED_MODELS,
-            "model_params": deepcopy(DEFAULT_MODEL_PARAMS),
-        }
-
-    try:
-        import yaml
-    except ImportError:
-        return {
-            "valid_models": SUPPORTED_MODELS,
-            "model_params": deepcopy(DEFAULT_MODEL_PARAMS),
-        }
-
-    try:
-        with config_file.open("r", encoding="utf-8") as file:
-            raw = yaml.safe_load(file) or {}
-    except Exception:
-        raw = {}
-
-    config_valid_models = raw.get("valid_models", SUPPORTED_MODELS)
-    valid_models = [
-        model_name
-        for model_name in config_valid_models
-        if model_name in SUPPORTED_MODELS
-    ]
-    if not valid_models:
-        valid_models = list(SUPPORTED_MODELS)
-
-    model_params = deepcopy(DEFAULT_MODEL_PARAMS)
-    loaded_model_params = raw.get("model_params", {})
-    if isinstance(loaded_model_params, dict):
-        for model_name, params in loaded_model_params.items():
-            if model_name in model_params and isinstance(params, dict):
-                model_params[model_name].update(params)
-
-    return {
-        "valid_models": valid_models,
-        "model_params": model_params,
-    }
-
-
-_APP_CONFIG = _load_config()
-VALID_MODELS = _APP_CONFIG["valid_models"]
-MODEL_PARAMS = _APP_CONFIG["model_params"]
+BACKBONE_CONFIG = _APP_CONFIG["backbone"]
 DEFAULT_MODEL_TYPE = VALID_MODELS[0]
 
-# ---------------------------------------------------------------------------
-# PyTorch helpers (imported lazily inside the classes that need them)
-# ---------------------------------------------------------------------------
+
+def get_drop_columns(drop_prod: bool = False) -> list[str]:
+    preprocessing = BACKBONE_CONFIG.get("preprocessing", {})
+    columns = list(preprocessing.get("drop_columns", []))
+    if drop_prod:
+        columns.extend(preprocessing.get("drop_prod_columns", []))
+    return list(dict.fromkeys(columns))
 
 
+def apply_clip_rules(df: pd.DataFrame, rules: list[dict[str, Any]] | None = None) -> pd.DataFrame:
+    out = df.copy()
+    active_rules = rules if rules is not None else BACKBONE_CONFIG.get("postprocess", {}).get("clip_rules", [])
 
-def _build_lstm_net(input_size: int, hidden_size: int, num_layers: int, dropout: float):
-    """Build a PyTorch LSTM regressor with custom weight initialization."""
-    """Build a PyTorch LSTM regressor with custom weight initialization."""
-    import torch
-    import torch.nn as nn
+    for rule in active_rules:
+        if not isinstance(rule, dict):
+            continue
 
-    class _LSTMNet(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lstm = nn.LSTM(
-                input_size=input_size,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=dropout if num_layers > 1 else 0.0,
-            )
-            self.dropout = nn.Dropout(dropout)
-            self.fc = nn.Linear(hidden_size, 1)
+        columns = list(rule.get("columns", []))
+        if not columns:
+            contains_any = list(rule.get("contains_any", []))
+            if contains_any:
+                columns = [
+                    name for name in out.columns if any(fragment in name for fragment in contains_any)
+                ]
 
-        def forward(self, x):
-            out, _ = self.lstm(x)
-            out = self.dropout(out[:, -1, :])
-            return self.fc(out).squeeze(-1)
+        if not columns:
+            continue
 
-    # --- INITIALISATION DES POIDS ---
-    def init_weights(m):
-        if isinstance(m, nn.LSTM):
-            for name, param in m.named_parameters():
-                if 'weight_ih' in name:
-                    # Xavier pour les entrées vers hidden
-                    nn.init.xavier_uniform_(param.data)
-                elif 'weight_hh' in name:
-                    # Orthogonal pour le récurrent (maintient la norme du gradient)
-                    nn.init.orthogonal_(param.data)
-                elif 'bias' in name:
-                    n = param.size(0)
-                    param.data[n//4: n//2].fill_(1.0)  # forget gate bias = 1
-        elif isinstance(m, nn.Linear):
-            # Xavier pour la couche de sortie
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None:
-                m.bias.data.fill_(0)
+        existing = [name for name in columns if name in out.columns]
+        if not existing:
+            continue
 
-    model = _LSTMNet()
-    model.apply(init_weights)  # Applique l'initialisation à tout le réseau
-    return model
+        replace_inf_with = rule.get("replace_inf_with")
+        if replace_inf_with is not None:
+            out[existing] = out[existing].replace([float("inf"), float("-inf")], replace_inf_with)
 
+        fillna_value = rule.get("fillna")
+        if fillna_value is not None:
+            out[existing] = out[existing].fillna(fillna_value)
 
-def _build_transformer_net(input_size: int, d_model: int, nhead: int,
-                            num_layers: int, dropout: float):
-    """Build a PyTorch Transformer regressor."""
-    import math
-    import torch
-    import torch.nn as nn
+        lower = rule.get("lower")
+        upper = rule.get("upper")
+        if lower is not None or upper is not None:
+            out[existing] = out[existing].clip(lower=lower, upper=upper)
 
-    class PositionalEncoding(nn.Module):
-        def __init__(self, d_model: int, max_len: int = 5000):
-            super().__init__()
-            position = torch.arange(max_len).unsqueeze(1)
-            div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-            pe = torch.zeros(max_len, d_model)
-            pe[:, 0::2] = torch.sin(position * div_term)
-            pe[:, 1::2] = torch.cos(position * div_term)
-            self.register_buffer('pe', pe.unsqueeze(0))
+    return out
 
-        def forward(self, x):
-            x = x + self.pe[:, :x.size(1), :]
-            return x
-
-    class _TransformerNet(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.input_proj = nn.Linear(input_size, d_model)
-            self.pos_encoder = PositionalEncoding(d_model)
-            self.dropout = nn.Dropout(dropout)
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=d_model, nhead=nhead, dropout=dropout,
-                dim_feedforward=d_model * 4, batch_first=True,
-            )
-            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-            self.fc = nn.Linear(d_model, 1)
-
-        def forward(self, x):                       # x: (B, T, F)
-            x = self.input_proj(x)                  # (B, T, d_model)
-            x = self.pos_encoder(x)
-            x = self.dropout(x)
-            x = self.encoder(x)                     # (B, T, d_model)
-            x = x[:, -1, :]                         # last timestep (B, d_model)
-            return self.fc(x).squeeze(-1)            # (B,)
-
-    return _TransformerNet()
-
-# ---------------------------------------------------------------------------
-# DataProcessor
-# ---------------------------------------------------------------------------
 
 class DataProcessor:
-    """Data Processing class."""
-
-    def __init__(self, path_folder: str, X: pd.DataFrame = None, drop_columns: list = []):
+    def __init__(self, path_folder: str, X: Optional[pd.DataFrame] = None, drop_columns: Optional[list] = None):
         self.path = path_folder
-        self.time_column = "delivery_time"
-        self.predict_column = "production_normalized"
-        self.drop_columns = list(set(
-            drop_columns + ['production', 'installed_capacity', 'is_not_plateau']))
-        self.drop_columns = list(set(
-            drop_columns + ['production', 'installed_capacity', 'is_not_plateau']))
-        self.df = self.open_data() if X is None else X
-        
-    def run(self) -> pd.DataFrame:
-        """Run the full processing pipeline."""
-        df = self.prepocess_data()
-        df = self.impute_production(df)
-        df = self.engineer_features(df)
-        return df
-        
-    def run(self) -> pd.DataFrame:
-        """Run the full processing pipeline."""
-        df = self.prepocess_data()
-        df = self.impute_production(df)
-        df = self.engineer_features(df)
-        return df
+        schema = BACKBONE_CONFIG.get("schema", {})
+        data_cfg = BACKBONE_CONFIG.get("data", {})
+        preprocessing = BACKBONE_CONFIG.get("preprocessing", {})
+
+        self.time_column = schema.get("time_column", "delivery_time")
+        self.group_column = schema.get("group_column", "site_name")
+        self.predict_column = schema.get("target_column", "production_normalized")
+        self.raw_target_column = schema.get("raw_target_column", "production")
+        self.capacity_column = schema.get("capacity_column", "installed_capacity")
+        self.file_pattern = data_cfg.get("file_pattern", "dataset_*.parquet")
+        self.exclude_files = set(data_cfg.get("exclude_files", []))
+
+        dropped = drop_columns or []
+        default_drop = preprocessing.get("drop_columns", ["production", "installed_capacity", "is_not_plateau"])
+        self.drop_columns = list(dict.fromkeys([*dropped, *default_drop]))
+        self.df = self.open_data() if X is None else X.copy()
 
     def open_data(self) -> pd.DataFrame:
-        """Open and merge data while fixing type mismatches"""
+        files = sorted(Path(self.path).glob(self.file_pattern))
         main_df = None
-        files = sorted(Path(self.path).glob("*.parquet"))
-        
+
         for file in files:
-            if "dataset_2" in file.name:
+            if any(fragment in file.name for fragment in self.exclude_files):
                 continue
-                
-            current_df = pd.read_parquet(file)
-            if "delivery_time" in current_df.columns:
-                current_df["delivery_time"] = pd.to_datetime(current_df["delivery_time"], utc=True)
+            current = pd.read_parquet(file)
+            if self.time_column in current.columns:
+                current[self.time_column] = pd.to_datetime(current[self.time_column], utc=True)
+
             if main_df is None:
-                main_df = current_df
+                main_df = current
             else:
-                main_df["delivery_time"] = pd.to_datetime(main_df["delivery_time"], utc=True)
+                if self.time_column in main_df.columns:
+                    main_df[self.time_column] = pd.to_datetime(main_df[self.time_column], utc=True)
                 main_df = pd.merge(
-                    main_df, 
-                    current_df, 
-                    on=["site_name", "delivery_time"], 
-                    how="inner"
+                    main_df,
+                    current,
+                    on=[self.group_column, self.time_column],
+                    how="inner",
                 )
-        return main_df if main_df is not None else pd.DataFrame()
 
-    def prepocess_data(self,
-                    N: int = 5,
-                    window: str = "24h",
-                    tolerance: float = 0.01,
-                    low_thresh: float = 0.1,
-                    high_thresh: float = 0.90) -> pd.DataFrame:
+        if main_df is None:
+            return pd.DataFrame()
+        return main_df
 
+    def run(self) -> pd.DataFrame:
+        preprocessing = BACKBONE_CONFIG.get("preprocessing", {})
+        plateau_cfg = preprocessing.get("plateau", {})
+        imputation_cfg = preprocessing.get("imputation", {})
+        feature_cfg = preprocessing.get("feature_engineering", {})
+
+        df = self.preprocess_data()
+        if imputation_cfg.get("enabled", True):
+            df = self.impute_production(df, max_gap_hours=int(imputation_cfg.get("max_gap_hours", 6)))
+        df = self.engineer_features(
+            df,
+            data_delay_days=int(feature_cfg.get("data_delay_days", 15)),
+            feature_cfg=feature_cfg,
+        )
+        return df
+
+    def preprocess_data(
+        self,
+        N: int = 5,
+        window: str = "24h",
+        tolerance: float = 0.01,
+        low_thresh: float = 0.1,
+        high_thresh: float = 0.9,
+    ) -> pd.DataFrame:
         df = self.df.copy()
+        required = [self.group_column, self.time_column]
+        if self.predict_column not in df.columns:
+            required.extend([self.raw_target_column, self.capacity_column])
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
 
-        df["production_normalized"] = df["production"] / df["installed_capacity"]
+        if self.predict_column not in df.columns:
+            df = df[df[self.capacity_column] != 0].copy()
+            df[self.predict_column] = df[self.raw_target_column] / df[self.capacity_column]
 
-        df = compute_plateau(df=df, N=N, window=window, tolerance=tolerance, low_thresh=low_thresh, high_thresh=high_thresh)
-        
-        df = compute_plateau(df=df, N=N, window=window, tolerance=tolerance, low_thresh=low_thresh, high_thresh=high_thresh)
-        
+        plateau_cfg = BACKBONE_CONFIG.get("preprocessing", {}).get("plateau", {})
+        if plateau_cfg.get("enabled", True):
+            df = compute_plateau(
+                df=df,
+                time_col=self.time_column,
+                group_col=self.group_column,
+                target_col=self.predict_column,
+                N=int(plateau_cfg.get("N", N)),
+                window=str(plateau_cfg.get("window", window)),
+                tolerance=float(plateau_cfg.get("tolerance", tolerance)),
+                low_thresh=float(plateau_cfg.get("low_thresh", low_thresh)),
+                high_thresh=float(plateau_cfg.get("high_thresh", high_thresh)),
+            )
         self.df = df
         return df
 
-    # def impute_production(self, df: pd.DataFrame, max_gap_hours: int = 6) -> pd.DataFrame:
-    #     results = []
-    #     for site, grp in df.groupby("site_name"):
-    #         # On s'assure que le temps est bien au format datetime
-    #         grp[self.time_column] = pd.to_datetime(grp[self.time_column])
-    #         grp = grp.sort_values(self.time_column).copy()
-
-    #         # 1. Plateaux → NaN
-    #         if "is_not_plateau" in grp.columns:
-    #             grp.loc[~grp["is_not_plateau"], "production_normalized"] = np.nan
-
-    #         # --- FIX ICI ---
-    #         # On passe la colonne temporelle en index pour permettre l'interpolation "time"
-    #         grp = grp.set_index(self.time_column)
-
-    #         # 2. Interpolation temporelle
-    #         grp["production_normalized"] = (
-    #             grp["production_normalized"]
-    #             .interpolate(method="time", limit=max_gap_hours)
-    #         )
-
-    #         # On repasse en index numérique pour la suite des opérations (fillna, etc.)
-    #         grp = grp.reset_index()
-    #         # ---------------
-
-    #         # 3. Trous longs résiduels → médiane du site
-    #         site_median = grp["production_normalized"].median()
-    #         grp["production_normalized"] = grp["production_normalized"].fillna(
-    #             site_median)
-
-    #         # 4. ffill/bfill pour les bords
-    #         grp["production_normalized"] = (
-    #             grp["production_normalized"].ffill().bfill()
-    #         )
-
-    #         results.append(grp)
-
-        # return pd.concat(results, ignore_index=True)
-    
     def impute_production(self, df: pd.DataFrame, max_gap_hours: int = 6) -> pd.DataFrame:
         results = []
-        for site, grp in df.groupby("site_name"):
-            grp[self.time_column] = pd.to_datetime(grp[self.time_column])
-            grp = grp.sort_values(self.time_column).copy()
-            grp[self.time_column] = pd.to_datetime(grp[self.time_column])
 
-            if "is_not_plateau" in grp.columns:
-                grp.loc[~grp["is_not_plateau"], "production_normalized"] = np.nan
+        for group_value, grp in df.groupby(self.group_column):
+            local = grp.copy()
+            local[self.time_column] = pd.to_datetime(local[self.time_column], utc=True)
+            local = local.sort_values(self.time_column)
 
-            # 2. Interpolation temporelle (On garde, c'est le top pour les petits trous)
-            grp = grp.set_index(self.time_column)
-            grp["production_normalized"] = grp["production_normalized"].interpolate(
-                method="time", limit=max_gap_hours
+            if "is_not_plateau" in local.columns:
+                local.loc[~local["is_not_plateau"], self.predict_column] = np.nan
 
-            grp["production_normalized"] = (
-                grp["production_normalized"]
-                .interpolate(method="time", limit=max_gap_hours)
-            )
+            local = local.set_index(self.time_column)
+            local[self.predict_column] = local[self.predict_column].interpolate(method="time", limit=max_gap_hours)
+            local = local.reset_index()
 
-            grp = grp.reset_index()
+            if local[self.predict_column].isna().any():
+                local["tmp_hour"] = local[self.time_column].dt.hour
+                hourly_map = local.groupby("tmp_hour")[self.predict_column].mean()
+                hourly_map = hourly_map.fillna(local[self.predict_column].median())
+                local[self.predict_column] = local[self.predict_column].fillna(local["tmp_hour"].map(hourly_map))
+                local = local.drop(columns=["tmp_hour"])
 
-            # Au lieu d'une médiane fixe, on utilise la moyenne par heure (0-23h)
-            if grp["production_normalized"].isnull().any():
-                # On crée une clé temporaire pour l'heure
-                grp['tmp_hour'] = grp[self.time_column].dt.hour
+            local[self.predict_column] = local[self.predict_column].ffill().bfill()
+            local[self.group_column] = group_value
+            results.append(local)
 
-                # On calcule la moyenne de prod pour chaque heure sur ce site
-                hourly_map = grp.groupby('tmp_hour')[
-                    "production_normalized"].mean()
-
-                # Si une heure est totalement vide (rare), on met la médiane du site en secours
-                hourly_map = hourly_map.fillna(
-                    grp["production_normalized"].median())
-
-                # On remplit les NaNs en mappant l'heure sur nos moyennes
-                grp["production_normalized"] = grp["production_normalized"].fillna(
-                    grp['tmp_hour'].map(hourly_map)
-                )
-                grp = grp.drop(columns=['tmp_hour'])
-            # --------------------------------------------------
-
-            grp["production_normalized"] = (
-                grp["production_normalized"].ffill().bfill()
-            )
-
-            results.append(grp)
+        if not results:
+            return df
 
         return pd.concat(results, ignore_index=True)
-    
-    def engineer_features(self, df: pd.DataFrame, data_delay_days: int = 15) -> pd.DataFrame:
-        """Engineer features for the model."""
-        df = df.copy()
-        df = df.dropna(subset=[self.time_column, "production", "installed_capacity"])
-        df = df[df["installed_capacity"] != 0]
 
-        df[self.time_column] = pd.to_datetime(df[self.time_column])
-        df["hour"]        = df[self.time_column].dt.hour
-        df["day_of_week"] = df[self.time_column].dt.dayofweek
-        df["month"] = df[self.time_column].dt.month
-        df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
-        df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
-        df["is_weekend"]  = (df["day_of_week"] >= 5).astype(int)
-        df["is_night"]    = ((df["hour"] < 6) | (df["hour"] >= 22)).astype(int)
-        df["hour_sin"]    = np.sin(2 * np.pi * df["hour"] / 24)
-        df["hour_cos"]    = np.cos(2 * np.pi * df["hour"] / 24)
-        df["dow_sin"]     = np.sin(2 * np.pi * df["day_of_week"] / 7)
-        df["dow_cos"]     = np.cos(2 * np.pi * df["day_of_week"] / 7)
+    def engineer_features(
+        self,
+        df: pd.DataFrame,
+        data_delay_days: int = 15,
+        feature_cfg: Optional[dict[str, Any]] = None,
+    ) -> pd.DataFrame:
+        feature_cfg = feature_cfg or {}
+        local = df.copy()
+        local[self.time_column] = pd.to_datetime(local[self.time_column], utc=True)
+        required_cols = [self.time_column, self.predict_column, self.group_column]
+        if self.raw_target_column in local.columns and self.capacity_column in local.columns:
+            required_cols.extend([self.raw_target_column, self.capacity_column])
+        local = local.dropna(subset=required_cols)
+        if self.capacity_column in local.columns:
+            local = local[local[self.capacity_column] != 0]
 
-        # Evite les gros pics
-        df['precipitation'] = np.log1p(df['precipitation'])
-        
+        if feature_cfg.get("time_features", True):
+            local["hour"] = local[self.time_column].dt.hour
+            local["day_of_week"] = local[self.time_column].dt.dayofweek
+            local["month"] = local[self.time_column].dt.month
+            local["month_sin"] = np.sin(2 * np.pi * local["month"] / 12)
+            local["month_cos"] = np.cos(2 * np.pi * local["month"] / 12)
+            local["is_weekend"] = (local["day_of_week"] >= 5).astype(int)
+            local["is_night"] = ((local["hour"] < 6) | (local["hour"] >= 22)).astype(int)
+            local["hour_sin"] = np.sin(2 * np.pi * local["hour"] / 24)
+            local["hour_cos"] = np.cos(2 * np.pi * local["hour"] / 24)
+            local["dow_sin"] = np.sin(2 * np.pi * local["day_of_week"] / 7)
+            local["dow_cos"] = np.cos(2 * np.pi * local["day_of_week"] / 7)
 
-        # Evite les gros pics
-        df['precipitation'] = np.log1p(df['precipitation'])
-        
-        df["production_normalized"] = df["production"] / df["installed_capacity"]
+        if feature_cfg.get("weather_features", True) and "precipitation" in local.columns:
+            local["precipitation"] = np.log1p(local["precipitation"].clip(lower=0))
 
-        df["wind_speed_diff"]  = df["wind_speed_100m"] - df["wind_speed_10m"]
-        for col in ["wind_speed_10m", "wind_speed_100m"]:
-            df[f"{col}_squared"] = df[col] ** 2
-            df[f"{col}_cubed"]   = df[col] ** 3
-            
-            
-        df["wind_speed_ratio"] = df["wind_speed_100m"] / (df["wind_speed_10m"] + 1e-8)
-        v10 = df["wind_speed_10m"].clip(lower=0.5)
-        v100 = df["wind_speed_100m"].clip(lower=0.5)
-        df["wind_shear_alpha"] = np.log(v100 / v10) / np.log(100 / 10)
-        
-        min_lag_h = data_delay_days * 24
-        
-        results = []
-        for site, grp in df.groupby("site_name"):
-            grp = grp.set_index(self.time_column).sort_index()
+        if self.raw_target_column in local.columns and self.capacity_column in local.columns:
+            local[self.predict_column] = local[self.raw_target_column] / local[self.capacity_column]
 
-            full_idx = pd.date_range(grp.index.min(), grp.index.max(), freq="1h", tz="UTC")
-            grp = grp.reindex(full_idx)
-            grp["site_name"] = site
+        if feature_cfg.get("weather_features", True) and "wind_speed_100m" in local.columns and "wind_speed_10m" in local.columns:
+            local["wind_speed_diff"] = local["wind_speed_100m"] - local["wind_speed_10m"]
+            for col in ["wind_speed_10m", "wind_speed_100m"]:
+                local[f"{col}_squared"] = local[col] ** 2
+                local[f"{col}_cubed"] = local[col] ** 3
 
-            grp[f"production_lag{min_lag_h}h"] = grp["production_normalized"].shift(
-                min_lag_h)
-            grp[f"production_lag{min_lag_h + 24}h"] = grp["production_normalized"].shift(
-                min_lag_h + 24)
-            grp["production_lag720h"] = grp["production_normalized"].shift(720)
+            local["wind_speed_ratio"] = local["wind_speed_100m"] / (local["wind_speed_10m"] + 1e-8)
+            v10 = local["wind_speed_10m"].clip(lower=0.5)
+            v100 = local["wind_speed_100m"].clip(lower=0.5)
+            local["wind_shear_alpha"] = np.log(v100 / v10) / np.log(100 / 10)
 
-            shifted = grp["production_normalized"].shift(min_lag_h)
-            grp["production_rolling_mean_7d"] = shifted.rolling(
-                168, min_periods=84).mean()
-            grp["production_rolling_std_7d"] = shifted.rolling(
-                168, min_periods=84).std()
-            grp["production_rolling_mean_14d"] = shifted.rolling(
-                336, min_periods=168).mean()
-            grp["production_rolling_std_14d"] = shifted.rolling(
-                336, min_periods=168).std()
+        if feature_cfg.get("lag_features", True):
+            min_lag_h = data_delay_days * 24
+            results = []
 
-            if "is_not_plateau" in grp.columns:
-                grp = grp[grp["is_not_plateau"].fillna(False)]
+            for group_value, grp in local.groupby(self.group_column):
+                group_df = grp.set_index(self.time_column).sort_index()
+                full_idx = pd.date_range(group_df.index.min(), group_df.index.max(), freq="1h", tz="UTC")
+                group_df = group_df.reindex(full_idx)
+                group_df[self.group_column] = group_value
 
-            results.append(grp.reset_index().rename(columns={"index": self.time_column}))
+                group_df[f"production_lag{min_lag_h}h"] = group_df[self.predict_column].shift(min_lag_h)
+                group_df[f"production_lag{min_lag_h + 24}h"] = group_df[self.predict_column].shift(min_lag_h + 24)
+                group_df["production_lag720h"] = group_df[self.predict_column].shift(720)
 
-        df = pd.concat(results, ignore_index=True)
-        
-        # --- Features physiques vent (issues du NWP, toujours disponibles) ---
-        if "wind_direction_100m" in df.columns:
-            rad = np.radians(df["wind_direction_100m"])
-            # Convention météo : direction = origine du vent (0°=Nord, 90°=Est)
-            # U (zonal, positif vers l'Est)     = -speed * sin(dir)
-            # V (méridional, positif vers le Nord) = -speed * cos(dir)
-            df["wind_u_100m"] = -df["wind_speed_100m"] * np.sin(rad)
-            df["wind_v_100m"] = -df["wind_speed_100m"] * np.cos(rad)
-        
-        if "wind_direction_10m" in df.columns:
-            rad = np.radians(df["wind_direction_10m"])
-            # Convention météo : direction = origine du vent (0°=Nord, 90°=Est)
-            # U (zonal, positif vers l'Est)     = -speed * sin(dir)
-            # V (méridional, positif vers le Nord) = -speed * cos(dir)
-            df["wind_u_10m"] = -df["wind_speed_10m"] * np.sin(rad)
-            df["wind_v_10m"] = -df["wind_speed_10m"] * np.cos(rad)
+                shifted = group_df[self.predict_column].shift(min_lag_h)
+                group_df["production_rolling_mean_7d"] = shifted.rolling(168, min_periods=84).mean()
+                group_df["production_rolling_std_7d"] = shifted.rolling(168, min_periods=84).std()
+                group_df["production_rolling_mean_14d"] = shifted.rolling(336, min_periods=168).mean()
+                group_df["production_rolling_std_14d"] = shifted.rolling(336, min_periods=168).std()
 
-        if "temperature_2m" in df.columns and "pressure_msl" in df.columns:
-            # Densité de l'air : ρ = P / (R_d * T),  R_d = 287.05 J/(kg·K)
-            df["air_density"] = df["pressure_msl"] / \
-                (287.05 * (df["temperature_2m"] + 273.15))
-            # Puissance éolienne théorique ∝ ρ·v³ (avant coefficient de puissance Cp)
-            df["theoretical_power"] = df["air_density"] * df["wind_speed_100m"] ** 3
-        
-        df = df.replace([np.inf, -np.inf], np.nan)
+                if "is_not_plateau" in group_df.columns:
+                    group_df = group_df[group_df["is_not_plateau"].fillna(False)]
 
-        return df
-    
-    def finalize_for_model(self, df):
-        to_exclude = self.drop_columns
+                results.append(group_df.reset_index().rename(columns={"index": self.time_column}))
 
-        cols_to_keep = [c for c in df.columns if c not in to_exclude]
+            if not results:
+                return local
 
+            local = pd.concat(results, ignore_index=True)
+
+        if "wind_direction_100m" in local.columns and "wind_speed_100m" in local.columns:
+            rad = np.radians(local["wind_direction_100m"])
+            local["wind_u_100m"] = -local["wind_speed_100m"] * np.sin(rad)
+            local["wind_v_100m"] = -local["wind_speed_100m"] * np.cos(rad)
+
+        if "wind_direction_10m" in local.columns and "wind_speed_10m" in local.columns:
+            rad = np.radians(local["wind_direction_10m"])
+            local["wind_u_10m"] = -local["wind_speed_10m"] * np.sin(rad)
+            local["wind_v_10m"] = -local["wind_speed_10m"] * np.cos(rad)
+
+        if "temperature_2m" in local.columns and "pressure_msl" in local.columns and "wind_speed_100m" in local.columns:
+            local["air_density"] = local["pressure_msl"] / (287.05 * (local["temperature_2m"] + 273.15))
+            local["theoretical_power"] = local["air_density"] * local["wind_speed_100m"] ** 3
+
+        local = local.replace([np.inf, -np.inf], np.nan)
+        return local
+
+    def finalize_for_model(self, df: pd.DataFrame) -> pd.DataFrame:
+        cols_to_keep = [col for col in df.columns if col not in self.drop_columns]
         mask = df[cols_to_keep].notna().all(axis=1)
+        return df.loc[mask, cols_to_keep].copy()
 
-        df_final = df.loc[mask, cols_to_keep]
 
-        return df_final
+def compute_plateau(
+    df: pd.DataFrame,
+    time_col: str = "delivery_time",
+    group_col: str = "site_name",
+    target_col: str = "production_normalized",
+    N: int = 5,
+    window: str = "24h",
+    tolerance: float = 0.01,
+    low_thresh: float = 0.1,
+    high_thresh: float = 0.9,
+) -> pd.DataFrame:
+    if target_col not in df.columns:
+        out = df.copy()
+        out["is_not_plateau"] = True
+        return out
 
-def compute_plateau(df: pd.DataFrame, N: int = 5, window: str = "24h", tolerance: float = 0.01, low_thresh: float = 0.1, high_thresh: float = 0.9):
-
-    def count_similar_in_window(series, window, tol):
-        # Déduire le pas temporel
+    def count_similar_in_window(series: pd.Series, time_window: str, tol: float) -> pd.Series:
         freq = series.index.to_series().diff().median()
-        half_window = pd.Timedelta(window) / 2
-        n_points = int(half_window / freq)  # nb de points de chaque côté
-
+        if pd.isna(freq) or freq == pd.Timedelta(0):
+            freq = pd.Timedelta("1h")
+        try:
+            freq_delta = pd.to_timedelta(freq)
+        except Exception:
+            freq_delta = pd.Timedelta("1h")
+        if freq_delta <= pd.Timedelta(0):
+            freq_delta = pd.Timedelta("1h")
+        half_window = pd.Timedelta(time_window) / 2
+        ratio = half_window.total_seconds() / freq_delta.total_seconds()
+        n_points = max(1, int(ratio))
         values = series.values
-        counts = np.array([
-            np.sum(np.abs(values[max(0, i-n_points):i+n_points+1] - v) < tol)
-            for i, v in enumerate(values)
-        ])
+        counts = np.array(
+            [
+                np.sum(np.abs(values[max(0, i - n_points) : i + n_points + 1] - value) < tol)
+                for i, value in enumerate(values)
+            ]
+        )
         return pd.Series(counts, index=series.index)
 
-    results = []
-    for site, df_site in df.groupby("site_name"):
-        df_site = df_site.sort_values("delivery_time").copy()
-        df_site = df_site.set_index("delivery_time")
+    outputs = []
 
-        p_max = df_site["production_normalized"].max()
+    for _, site_df in df.groupby(group_col):
+        local = site_df.sort_values(time_col).copy()
+        local = local.set_index(time_col)
+
+        p_max = local[target_col].max()
         p_low = p_max * low_thresh
         p_high = p_max * high_thresh
 
-        df_site["similar_count"] = count_similar_in_window(
-            df_site["production_normalized"], window, tolerance)
-        in_zone = (df_site["production_normalized"] >= p_low) & (
-            df_site["production_normalized"] <= p_high)
-        df_site["is_not_plateau"] = ~(
-            (df_site["similar_count"] >= N) & in_zone)
+        local["similar_count"] = count_similar_in_window(local[target_col], window, tolerance)
+        in_zone = (local[target_col] >= p_low) & (local[target_col] <= p_high)
+        local["is_not_plateau"] = ~((local["similar_count"] >= N) & in_zone)
 
-        results.append(df_site.drop(columns=["similar_count"]).reset_index())
-        
-        results.append(df_site.drop(columns=["similar_count"]).reset_index())
-        
-    return pd.concat(results, ignore_index=True)
+        outputs.append(local.drop(columns=["similar_count"]).reset_index())
 
+    if not outputs:
+        return df
 
+    return pd.concat(outputs, ignore_index=True)
 
-# ---------------------------------------------------------------------------
-# ForecastModel
-# ---------------------------------------------------------------------------
 
 class ForecastModel:
-    """
-    Unified forecasting model supporting:
-        random_forest | xgboost | lightgbm | sarimax | lstm | transformer
-    """
-
-    def __init__(self, model_type: str = DEFAULT_MODEL_TYPE, savepath:str = None, verbose:bool = False, seq_len: int = 48):
-        self.verbose        = verbose
-        self.time_column    = "delivery_time"
-        self.predict_column = "production_normalized"
-        self.n_splits       = 5
-        self.model_type     = self._validate(model_type)
-        self.SKLEARN_DEFAULTS = dict(n_estimators=200, random_state=42, n_jobs=-1)
-        self.XGBOOST_TREE_METHOD = "hist"
-        self.LIGHTGBM_VERBOSE = -1
-        self.SARIMAX_ORDER = (1, 1, 1)
-        self.SARIMAX_SEAS_ORDER = (1, 1, 1, 24)
-        self.SARIMAX_ENFORCE_STATIONARITY = False
-        self.SARIMAX_ENFORCE_INVERTIBILITY = False
-        self.LSTM_SEQ_LEN = seq_len
-        self.LSTM_HIDDEN = 128
-        self.LSTM_LAYERS = 2
-        self.LSTM_DROPOUT = 0.4
-        self.TRANSFORMER_SEQ_LEN = 48
-        self.TRANSFORMER_D_MODEL = 64
-        self.TRANSFORMER_NHEAD = 4
-        self.TRANSFORMER_LAYERS = 2
-        self.TRANSFORMER_DROPOUT = 0.1
-        self.DL_EPOCHS = 20
-        self.DL_BATCH_SIZE = 256
-        self.DL_LR = 5e-5
-        self.DL_GRAD_CLIP = 1.0
-        self.DL_PATIENCE = 10
-        self.model          = None          # built lazily or at train time
-        self.scaler_X       = None          # used by LSTM / Transformer
-        self.scaler_y       = None          # used by LSTM / Transformer
-        self.evaluation_results: dict = {}
+    def __init__(
+        self,
+        model_type: str = DEFAULT_MODEL_TYPE,
+        savepath: Optional[str] = None,
+        verbose: bool = False,
+        seq_len: int = 48,
+    ):
+        self.verbose = verbose
+        self.model_type = self._validate_model_type(model_type)
+        schema = BACKBONE_CONFIG.get("schema", {})
+        self.time_column = schema.get("time_column", "delivery_time")
+        self.group_column = schema.get("group_column", "site_name")
+        self.predict_column = schema.get("target_column", "production_normalized")
+        self.n_splits = 5
         self.savepath = savepath
+        self.model: Any = None
+        self.feature_columns = []
+        self.input_size = None
+        self.evaluation_results: dict[str, Any] = {}
 
-        self._apply_model_params_from_config()
-        
-        if self.savepath:
-            p = Path(self.savepath)
-            # Dossier basé sur le nom du fichier (ex: models/lstm_v1_results/)
-            self.output_dir = p.parent / f"{p.stem}_results"
-            self.eval_dir = self.output_dir / "evaluation"
-            
-            # On crée les dossiers s'ils n'existent pas
-            self.eval_dir.mkdir(parents=True, exist_ok=True)
-            
-        #  Vérification si un modèle existe déjà au chemin spécifié
-        if self.savepath and Path(self.savepath).exists():
-            print(f"[{model_type}] Un modèle existant a été trouvé à {self.savepath}. Chargement...")
-            try:
-                self.load(self.savepath)
-            except Exception as e:
-                print(f"Erreur lors du chargement automatique : {e}")
-                print("Le modèle sera réinitialisé.")
-                self.model = None
-        else:
-            # 2. Si pas de fichier existant, on initialise normalement
-            self.model = None 
+        self.tree_defaults = {
+            "random_forest": {
+                "n_estimators": 200,
+                "random_state": 42,
+                "n_jobs": -1,
+            },
+            "xgboost": {
+                "n_estimators": 200,
+                "random_state": 42,
+                "n_jobs": -1,
+                "tree_method": "hist",
+                "verbosity": 0,
+            },
+            "lightgbm": {
+                "n_estimators": 200,
+                "random_state": 42,
+                "n_jobs": -1,
+                "verbose": -1,
+            },
+        }
+        self.knn_defaults = {
+            "n_neighbors": 25,
+            "weights": "distance",
+            "n_jobs": -1,
+        }
+        self.lstm_params = {
+            "seq_len": seq_len,
+            "hidden_size": 128,
+            "num_layers": 2,
+            "dropout": 0.2,
+            "epochs": 30,
+            "batch_size": 256,
+            "learning_rate": 1e-3,
+        }
+        self.transformer_params = {
+            "seq_len": seq_len,
+            "d_model": 64,
+            "nhead": 4,
+            "num_layers": 2,
+            "dropout": 0.1,
+            "epochs": 30,
+            "batch_size": 256,
+            "learning_rate": 1e-3,
+        }
+
+        self.scaler_X = None
+        self.scaler_y = None
+        self._apply_config()
+
+        if self.model_type in {"lstm", "transformer"}:
             self.scaler_X = StandardScaler()
             self.scaler_y = MinMaxScaler(feature_range=(0, 1))
-                
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
-    def train(self, df: pd.DataFrame, no_cv: bool = False) -> None:
-        """Train with time-series cross-validation, then refit on full data."""
-        dispatch = {
-            "random_forest": self._train_sklearn,
-            "xgboost":       self._train_sklearn,
-            "lightgbm":      self._train_sklearn,
-            "sarimax":       self._train_sarimax,
-            "lstm": lambda df: self._train_deep(df, no_cv=no_cv),
-            "transformer": lambda df: self._train_deep(df, no_cv=no_cv),
-        }
-        dispatch[self.model_type](df)
+        if self.savepath and Path(self.savepath).exists():
+            self.load(self.savepath)
 
-    def evaluate(self, df: pd.DataFrame = None, plot: bool = False) -> dict:
-        from sklearn.metrics import mean_absolute_error, mean_squared_error
-        import numpy as np
-
-    def evaluate(self, df: pd.DataFrame = None, plot: bool = False) -> dict:
-        from sklearn.metrics import mean_absolute_error, mean_squared_error
-        import numpy as np
-
-        results = dict(self.evaluation_results)
-        results["per_site_metrics"] = {}
-        results["per_site_metrics"] = {}
-        if df is not None:
-            if self.model_type in ['lstm', 'transformer']:
-                prediction, y_true = self._predict_deep(df)
-                seq_len = self._get_dl_params()["seq_len"]
-            else:
-                prediction = self.predict(df)
-                y_true = df[self.predict_column].to_numpy()
-                seq_len = 0
-
-            # Calcul des métriques
-            mae = mean_absolute_error(y_true, prediction)
-            mse = mean_squared_error(y_true, prediction)
-            rmse = np.sqrt(mse)
-
-            # nRMSE (normalisée par la moyenne pour donner un %)
-            mean_y = np.mean(y_true)
-            nrmse = (rmse / mean_y) if mean_y != 0 else 0
-
-            results.update({
-                "eval_mae": float(mae),
-                "eval_rmse": float(rmse),
-                "eval_nrmse": float(nrmse)
-            })
-            
-            df[self.time_column] = pd.to_datetime(
-                df[self.time_column]).dt.tz_localize(None)
-            all_dates = sorted(df[self.time_column].unique())
-            sum_df = pd.DataFrame(index=all_dates)
-            sum_df['total_true'] = 0.0
-            sum_df['total_pred'] = 0.0
-            sum_df['count'] = 0
-            
-
-            site_names = df['site_name'].unique()
-            current_idx = 0
-            
-            n_cols = 2
-            n_rows = (len(site_names) // n_cols) + 1
-            fig = plt.figure(figsize=(16, n_rows * 4.5))
-            fig.suptitle(f"Évaluation Multi-Sites (300 dernières heures): Modèle {self.model_type.upper()}\nMAE Global: {mae:.4f} | RMSE Global: {rmse:.4f}",
-                        fontsize=18, fontweight='bold', y=0.98)
-            for i, site in enumerate(site_names):
-                site_data = df[df['site_name'] == site]
-                site_data_len = len(df[df['site_name'] == site])
-                n_seq = site_data_len - seq_len
-
-                if n_seq <= 0:
-                    continue
-
-                site_pred = prediction[current_idx: current_idx + n_seq]
-                site_true = y_true[current_idx: current_idx + n_seq]
-                
-                site_dates = pd.to_datetime(
-                    site_data[self.time_column].iloc[seq_len:].values)
-
-                temp_site = pd.DataFrame({
-                    'total_true': site_true.flatten(),
-                    'total_pred': site_pred.flatten(),
-                    'count': 1
-                }, index=site_dates)
-
-                sum_df = sum_df.add(temp_site, fill_value=0)
-
-                s_mae = float(mean_absolute_error(site_true, site_pred))
-                s_rmse = float(np.sqrt(mean_squared_error(site_true, site_pred)))
-                s_mean_y = np.mean(site_true)
-                s_nrmse = float(
-                    s_rmse / s_mean_y) if s_mean_y != 0 else 0.0  # Ajout ici
-
-
-                results["per_site_metrics"][site] = {
-                    "mae": s_mae,
-                    "rmse": s_rmse,
-                    "nrmse": s_nrmse  # Ajout ici
-                }
-                                
-                
-                # Plot individuel
-                ax = plt.subplot(n_rows, n_cols, i + 1)
-                ax.plot(site_true[-300:], color='blue',
-                        alpha=0.7, label='Réel' if i == 0 else "")
-                ax.plot(site_pred[-300:], color='red', linestyle='--',
-                        alpha=0.8, label='Prédit' if i == 0 else "")
-
-                ax.set_title(f"Site: {site} - MAE: {mean_absolute_error(site_true, site_pred):.4f}",
-                            fontsize=12, pad=10)
-
-                # On n'affiche la légende que pour le premier plot pour ne pas répéter
-                if i == 0:
-                    ax.legend(loc='upper left',fontsize=12)
-                ax.grid(True, alpha=0.2)
-                current_idx += n_seq
-                
-            plt.subplots_adjust(
-                left=0.08,
-                right=0.92,
-                top=0.94,
-                bottom=0.06,
-                hspace=0.45,  # L'espace "respirable" mais pas vide
-                wspace=0.22
-            )
-            img_name = f"eval_plots_{self.model_type}.png"
-
-            # Chemin final : soit dans le dossier dédié, soit à la racine du projet
-            save_path = self.eval_dir / img_name if self.eval_dir else img_name
-
-            plt.savefig(save_path, bbox_inches='tight', dpi=120)
-            print(f"\n> Graphique Multi-sites sauvegardé sous : {save_path}")
-            
-            # On ne garde que les moments où on a des données (count > 0)
-            # On prend les 300 derniers points communs
-            valid_sum = sum_df[sum_df['count'] > 0].tail(300)
-
-            plt.figure(figsize=(15, 7))
-            plt.plot(valid_sum.index, valid_sum['total_true'],
-                    color='navy', label='Production Totale Réelle', linewidth=2)
-            plt.plot(valid_sum.index, valid_sum['total_pred'], color='crimson',
-                    linestyle='--', label='Production Totale Prédite', linewidth=2)
-
-            sum_mae = mean_absolute_error(
-                valid_sum['total_true'], valid_sum['total_pred'])
-            n_sites = len(site_names)
-            mae_par_site_equivalent = sum_mae / n_sites
-            plt.title(
-                f"Somme de tout les sites({len(site_names)} sites)\nMAE Sommé: {sum_mae:.4f} (Moyenne par site: {mae_par_site_equivalent:.4f})", fontsize=15, fontweight='bold')
-            plt.legend(loc='upper left')
-            plt.grid(True, alpha=0.3)
-            plt.xticks(rotation=45)
-
-            sum_img_name = f"eval_total_sum_{self.model_type}.png"
-            sum_save_path = self.eval_dir / sum_img_name if self.eval_dir else sum_img_name
-
-            plt.savefig(sum_save_path, bbox_inches='tight', dpi=120)
-            print(f"> Graphique de la somme sauvegardé sous : {sum_save_path}")
-            
-            n_sites = len(site_names)
-            full_portfolio_data = sum_df[sum_df['count'] == n_sites]
-
-            portfolio_mae_total = 0.0
-            portfolio_mae_per_site = 0.0
-            portfolio_rmse_total = 0.0
-            portfolio_rmse_per_site = 0.0
-
-            if len(full_portfolio_data) > 0:
-                portfolio_mae_total = float(mean_absolute_error(
-                    full_portfolio_data['total_true'],
-                    full_portfolio_data['total_pred']
-                ))
-                portfolio_mae_per_site = portfolio_mae_total / n_sites
-
-                portfolio_rmse_total = float(np.sqrt(mean_squared_error(
-                    full_portfolio_data['total_true'],
-                    full_portfolio_data['total_pred']
-                )))
-                portfolio_rmse_per_site = portfolio_rmse_total / n_sites
-
-                mean_portfolio_y = np.mean(full_portfolio_data['total_true'])
-
-
-                portfolio_nrmse_total = float(
-                    portfolio_rmse_total / mean_portfolio_y) if mean_portfolio_y != 0 else 0.0
-
-            results.update({
-                "portfolio_mae_total": portfolio_mae_total,
-                "portfolio_mae_per_site": portfolio_mae_per_site,
-                "portfolio_rmse_total": portfolio_rmse_total,
-                "portfolio_rmse_per_site": portfolio_rmse_per_site,
-                "portfolio_nrmse_total": portfolio_nrmse_total,  # Ajout ici
-                "n_sites": n_sites
-            })
-            
-            
-            if plot:
-                plt.show()
-                
-            
-
-        return results
-    
-    
-
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
-        """Predict on a new DataFrame."""
-        """Predict on a new DataFrame."""
-        if self.model is None:
-            raise ValueError("Model has not been trained yet.")
-
-
-        dispatch = {
-            "random_forest": self._predict_sklearn,
-            "xgboost":       self._predict_sklearn,
-            "lightgbm":      self._predict_sklearn,
-            "sarimax":       self._predict_sarimax,
-            "lstm":          self._predict_deep,
-            "transformer":   self._predict_deep,
-        }
-        return dispatch[self.model_type](df)
-
-    def save(self, path: str = None) -> None:
-        """Save the trained model to disk."""
-        import joblib
-        save_path = path or self.savepath
-        if not save_path:
-            raise ValueError("No save path provided.")
-        if self.model is None:
-            raise ValueError("No model to save. Train the model first.")
-            
-        save_path = str(save_path)
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        
-        if self.model_type in ("lstm", "transformer"):
-            import torch
-            checkpoint = {
-                'model_state_dict': self.model.state_dict(),
-                'scaler_X': self.scaler_X,
-                'scaler_y': self.scaler_y,
-                'input_size': getattr(self, 'input_size', None)
-            }
-            torch.save(checkpoint, save_path)
-        elif self.model_type == "sarimax":
-            self.model.save(save_path)
-        else:
-            joblib.dump(self.model, save_path)
-        print(f"[{self.model_type}] Model saved to {save_path}")
-
-    def load(self, path: str = None) -> None:
-        """Load a trained model from disk."""
-        import joblib
-        load_path = path or self.savepath
-        if not load_path:
-            raise ValueError("No load path provided.")
-            
-        load_path = str(load_path)
-        if not Path(load_path).exists():
-            raise FileNotFoundError(f"Model file not found: {load_path}")
-            
-        if self.model_type in ("lstm", "transformer"):
-            import torch
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            checkpoint = torch.load(load_path, map_location=device,
-                                    weights_only=False)  # 👈 en premier
-            self.input_size = checkpoint['input_size']
-            self.scaler_X = checkpoint['scaler_X']
-            self.scaler_y = checkpoint['scaler_y']
-            self.model = self._build_dl_model(self.input_size)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.model.to(device)
-        elif self.model_type == "sarimax":
-            import statsmodels.api as sm
-            self.model = sm.load(load_path)
-        else:
-            self.model = joblib.load(load_path)
-        print(f"[{self.model_type}] Model loaded from {load_path}")
-
-    # ------------------------------------------------------------------
-    # Model builders
-    # ------------------------------------------------------------------
-
-    def _validate(self, model_type: str) -> str:
-        self.VALID_MODELS = VALID_MODELS
-        if model_type not in self.VALID_MODELS:
-            raise ValueError(f"Invalid model type. Choose from {self.VALID_MODELS}")
+    def _validate_model_type(self, model_type: str) -> str:
+        if model_type not in VALID_MODELS:
+            raise ValueError(f"Invalid model type: {model_type}. Choose from {VALID_MODELS}")
         return model_type
 
-    def _build_sklearn_model(self):
-        if self.model_type == "random_forest":
-            from sklearn.ensemble import RandomForestRegressor
-            return RandomForestRegressor(**self.SKLEARN_DEFAULTS)
-        if self.model_type == "xgboost":
-            from xgboost import XGBRegressor
-            return XGBRegressor(
-                n_estimators=self.SKLEARN_DEFAULTS["n_estimators"],
-                random_state=self.SKLEARN_DEFAULTS["random_state"],
-                n_jobs=self.SKLEARN_DEFAULTS["n_jobs"],
-                tree_method=self.XGBOOST_TREE_METHOD,
-                tree_method=self.XGBOOST_TREE_METHOD,
-            )
-        if self.model_type == "lightgbm":
-            from lightgbm import LGBMRegressor
-            return LGBMRegressor(
-                n_estimators=self.SKLEARN_DEFAULTS["n_estimators"],
-                random_state=self.SKLEARN_DEFAULTS["random_state"],
-                n_jobs=self.SKLEARN_DEFAULTS["n_jobs"],
-                verbose=self.LIGHTGBM_VERBOSE,
-            )
-
-    def _apply_model_params_from_config(self) -> None:
+    def _apply_config(self) -> None:
         params = MODEL_PARAMS.get(self.model_type, {})
 
-        if self.model_type in ("random_forest", "xgboost", "lightgbm"):
-            for key in ("n_estimators", "random_state", "n_jobs"):
-                if key in params:
-                    self.SKLEARN_DEFAULTS[key] = params[key]
-            if self.model_type == "xgboost" and "tree_method" in params:
-                self.XGBOOST_TREE_METHOD = params["tree_method"]
-            if self.model_type == "lightgbm" and "verbose" in params:
-                self.LIGHTGBM_VERBOSE = params["verbose"]
+        if self.model_type in self.tree_defaults:
+            self.tree_defaults[self.model_type].update(params)
             return
 
-        if self.model_type == "sarimax":
-            if "order" in params:
-                self.SARIMAX_ORDER = tuple(params["order"])
-            if "seasonal_order" in params:
-                self.SARIMAX_SEAS_ORDER = tuple(params["seasonal_order"])
-            if "enforce_stationarity" in params:
-                self.SARIMAX_ENFORCE_STATIONARITY = params["enforce_stationarity"]
-            if "enforce_invertibility" in params:
-                self.SARIMAX_ENFORCE_INVERTIBILITY = params["enforce_invertibility"]
+        if self.model_type == "knn":
+            self.knn_defaults.update(params)
             return
 
         if self.model_type == "lstm":
-            self.LSTM_SEQ_LEN = params.get("seq_len", self.LSTM_SEQ_LEN)
-            self.LSTM_HIDDEN = params.get("hidden_size", self.LSTM_HIDDEN)
-            self.LSTM_LAYERS = params.get("num_layers", self.LSTM_LAYERS)
-            self.LSTM_DROPOUT = params.get("dropout", self.LSTM_DROPOUT)
-            self.DL_EPOCHS = params.get("epochs", self.DL_EPOCHS)
-            self.DL_BATCH_SIZE = params.get("batch_size", self.DL_BATCH_SIZE)
-            self.DL_LR = params.get("learning_rate", self.DL_LR)
+            self.lstm_params.update(params)
             return
 
         if self.model_type == "transformer":
-            self.TRANSFORMER_SEQ_LEN = params.get("seq_len", self.TRANSFORMER_SEQ_LEN)
-            self.TRANSFORMER_D_MODEL = params.get("d_model", self.TRANSFORMER_D_MODEL)
-            self.TRANSFORMER_NHEAD = params.get("nhead", self.TRANSFORMER_NHEAD)
-            self.TRANSFORMER_LAYERS = params.get("num_layers", self.TRANSFORMER_LAYERS)
-            self.TRANSFORMER_DROPOUT = params.get("dropout", self.TRANSFORMER_DROPOUT)
-            self.DL_EPOCHS = params.get("epochs", self.DL_EPOCHS)
-            self.DL_BATCH_SIZE = params.get("batch_size", self.DL_BATCH_SIZE)
-            self.DL_LR = params.get("learning_rate", self.DL_LR)
-                verbose=self.LIGHTGBM_VERBOSE,
-            )
+            self.transformer_params.update(params)
 
-    def _apply_model_params_from_config(self) -> None:
-        params = MODEL_PARAMS.get(self.model_type, {})
-
-        if self.model_type in ("random_forest", "xgboost", "lightgbm"):
-            for key in ("n_estimators", "random_state", "n_jobs"):
-                if key in params:
-                    self.SKLEARN_DEFAULTS[key] = params[key]
-            if self.model_type == "xgboost" and "tree_method" in params:
-                self.XGBOOST_TREE_METHOD = params["tree_method"]
-            if self.model_type == "lightgbm" and "verbose" in params:
-                self.LIGHTGBM_VERBOSE = params["verbose"]
+    def train(self, df: pd.DataFrame, no_cv: bool = False) -> None:
+        if self.model_type in {"random_forest", "xgboost", "lightgbm", "knn"}:
+            self._train_tabular(df)
             return
 
-        if self.model_type == "sarimax":
-            if "order" in params:
-                self.SARIMAX_ORDER = tuple(params["order"])
-            if "seasonal_order" in params:
-                self.SARIMAX_SEAS_ORDER = tuple(params["seasonal_order"])
-            if "enforce_stationarity" in params:
-                self.SARIMAX_ENFORCE_STATIONARITY = params["enforce_stationarity"]
-            if "enforce_invertibility" in params:
-                self.SARIMAX_ENFORCE_INVERTIBILITY = params["enforce_invertibility"]
-            return
+        self._train_deep(df, no_cv=no_cv)
 
-        if self.model_type == "lstm":
-            self.LSTM_SEQ_LEN = params.get("seq_len", self.LSTM_SEQ_LEN)
-            self.LSTM_HIDDEN = params.get("hidden_size", self.LSTM_HIDDEN)
-            self.LSTM_LAYERS = params.get("num_layers", self.LSTM_LAYERS)
-            self.LSTM_DROPOUT = params.get("dropout", self.LSTM_DROPOUT)
-            self.DL_EPOCHS = params.get("epochs", self.DL_EPOCHS)
-            self.DL_BATCH_SIZE = params.get("batch_size", self.DL_BATCH_SIZE)
-            self.DL_LR = params.get("learning_rate", self.DL_LR)
-            return
-
-        if self.model_type == "transformer":
-            self.TRANSFORMER_SEQ_LEN = params.get("seq_len", self.TRANSFORMER_SEQ_LEN)
-            self.TRANSFORMER_D_MODEL = params.get("d_model", self.TRANSFORMER_D_MODEL)
-            self.TRANSFORMER_NHEAD = params.get("nhead", self.TRANSFORMER_NHEAD)
-            self.TRANSFORMER_LAYERS = params.get("num_layers", self.TRANSFORMER_LAYERS)
-            self.TRANSFORMER_DROPOUT = params.get("dropout", self.TRANSFORMER_DROPOUT)
-            self.DL_EPOCHS = params.get("epochs", self.DL_EPOCHS)
-            self.DL_BATCH_SIZE = params.get("batch_size", self.DL_BATCH_SIZE)
-            self.DL_LR = params.get("learning_rate", self.DL_LR)
-
-    # ------------------------------------------------------------------
-    # sklearn / tree training  (fixes the variable-shadowing bug)
-    # ------------------------------------------------------------------
-
-    def _train_sklearn(self, df: pd.DataFrame) -> None:
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
         if self.model is None:
-            self.model = self._build_sklearn_model()
+            raise ValueError("Model is not trained or loaded")
 
-        tscv = TimeSeriesSplit(n_splits=self.n_splits)
-        maes = []
-        
-        unique_times = np.sort(df[self.time_column].unique())
-        
-        for train_idx, val_idx in tscv.split(unique_times):
-            train_dates = unique_times[train_idx]
-            val_dates = unique_times[val_idx]
-            
-            df_tr = df[df[self.time_column].isin(train_dates)]
-            df_val = df[df[self.time_column].isin(val_dates)]
-            
-            X_tr = df_tr.drop(columns=[self.time_column, self.predict_column, 'site_name'], errors='ignore')
-            y_tr = df_tr[self.predict_column]
-            X_val = df_val.drop(columns=[self.time_column, self.predict_column, 'site_name'], errors='ignore')
-            y_val = df_val[self.predict_column]
+        if self.model_type in {"random_forest", "xgboost", "lightgbm", "knn"}:
+            return self._predict_tabular(df)
+        pred, _, _, _ = self._predict_deep(df)
+        return pred
 
-            fold_model = clone(self.model)
-            fold_model.fit(X_tr, y_tr)
-            maes.append(mean_absolute_error(y_val, fold_model.predict(X_val)))
+    def evaluate(self, df: Optional[pd.DataFrame] = None, plot: bool = False) -> dict:
+        results = dict(self.evaluation_results)
 
-        cv_mae = float(np.mean(maes))
-        self.evaluation_results = {"cv_mae": cv_mae, "cv_mae_std": float(np.std(maes))}
-        print(f"[{self.model_type}] CV MAE: {cv_mae:.4f} ± {np.std(maes):.4f}")
+        if df is None:
+            return results
 
-        X_full = df.drop(columns=[self.time_column, self.predict_column, 'site_name'], errors='ignore')
-        y_full = df[self.predict_column]
-        self.model.fit(X_full, y_full)
+        if self.model_type in {"lstm", "transformer"}:
+            prediction, y_true, timestamps, sites = self._predict_deep(df)
+        else:
+            prediction = self.predict(df)
+            y_true = df[self.predict_column].to_numpy()
+            timestamps = pd.to_datetime(df[self.time_column], utc=True).to_numpy()
+            if self.group_column in df.columns:
+                sites = df[self.group_column].astype(str).to_numpy()
+            else:
+                sites = np.array(["global"] * len(df))
 
-    def _predict_sklearn(self, df: pd.DataFrame) -> np.ndarray:
-        X = df.drop(columns=[self.time_column, self.predict_column, 'site_name'], errors="ignore")
-        if X.empty:
-            raise ValueError("No prediction features available after preprocessing.")
-        return self.model.predict(X)
+        if len(prediction) == 0:
+            raise ValueError("No predictions were generated for evaluation")
 
-    # ------------------------------------------------------------------
-    # SARIMAX
-    # ------------------------------------------------------------------
+        mae = mean_absolute_error(y_true, prediction)
+        rmse = float(np.sqrt(mean_squared_error(y_true, prediction)))
+        mean_y = float(np.mean(y_true)) if len(y_true) else 0.0
+        nrmse = (rmse / mean_y) if mean_y != 0 else 0.0
 
-    def _train_sarimax(self, df: pd.DataFrame) -> None:
-        from statsmodels.tsa.statespace.sarimax import SARIMAX
-
-        series = (
-            df.set_index(self.time_column)[self.predict_column]
-            .sort_index()
-        )
-        if series.index.has_duplicates:
-            series = series.groupby(level=0).mean()
-        series = series.asfreq("h").interpolate(method="time").ffill().bfill()
-
-        tscv  = TimeSeriesSplit(n_splits=self.n_splits)
-        idx   = np.arange(len(series))
-        maes  = []
-
-        for train_idx, val_idx in tscv.split(idx):
-            train_s = series.iloc[train_idx]
-            val_s   = series.iloc[val_idx]
-            try:
-                res = SARIMAX(
-                    train_s,
-                    order=self.SARIMAX_ORDER,
-                    seasonal_order=self.SARIMAX_SEAS_ORDER,
-                    enforce_stationarity=self.SARIMAX_ENFORCE_STATIONARITY,
-                    enforce_invertibility=self.SARIMAX_ENFORCE_INVERTIBILITY,
-                    enforce_stationarity=self.SARIMAX_ENFORCE_STATIONARITY,
-                    enforce_invertibility=self.SARIMAX_ENFORCE_INVERTIBILITY,
-                ).fit(disp=False)
-                preds = res.forecast(steps=len(val_s))
-                maes.append(mean_absolute_error(val_s, preds))
-            except Exception as exc:
-                print(f"  SARIMAX fold skipped: {exc}")
-
-        cv_mae = float(np.mean(maes)) if maes else float("nan")
-        self.evaluation_results = {"cv_mae": cv_mae}
-        print(f"[sarimax] CV MAE: {cv_mae:.4f}")
-
-        self.model = SARIMAX(
-            series,
-            order=self.SARIMAX_ORDER,
-            seasonal_order=self.SARIMAX_SEAS_ORDER,
-            enforce_stationarity=self.SARIMAX_ENFORCE_STATIONARITY,
-            enforce_invertibility=self.SARIMAX_ENFORCE_INVERTIBILITY,
-            enforce_stationarity=self.SARIMAX_ENFORCE_STATIONARITY,
-            enforce_invertibility=self.SARIMAX_ENFORCE_INVERTIBILITY,
-        ).fit(disp=False)
-
-    def _predict_sarimax(self, df: pd.DataFrame) -> np.ndarray:
-        n_steps = len(df)
-        forecast = self.model.forecast(steps=n_steps)
-        return forecast.values
-
-    # ------------------------------------------------------------------
-    # Deep-learning helpers (LSTM & Transformer share the same loop)
-    # ------------------------------------------------------------------
-
-    def _to_arrays(self, frame, feat_cols, target_col):
-        # Juste pour transformer un DF en matrice numpy propre pour les scalers
-        mask = frame[feat_cols].notna().all(
-            axis=1) & frame[target_col].notna()
-        f = frame[mask]
-        return f[feat_cols].values.astype(np.float32), f[target_col].values.astype(np.float32), mask
-
-    def _to_arrays(self, frame, feat_cols, target_col):
-        # Juste pour transformer un DF en matrice numpy propre pour les scalers
-        mask = frame[feat_cols].notna().all(
-            axis=1) & frame[target_col].notna()
-        f = frame[mask]
-        return f[feat_cols].values.astype(np.float32), f[target_col].values.astype(np.float32), mask
-
-    def _get_dl_params(self) -> dict:
-        if self.model_type == "lstm":
-            return dict(
-                seq_len=self.LSTM_SEQ_LEN,
-                epochs=self.DL_EPOCHS,
-                batch=self.DL_BATCH_SIZE,
-            )
-        return dict(
-            seq_len=self.TRANSFORMER_SEQ_LEN,
-            epochs=self.DL_EPOCHS,
-            batch=self.DL_BATCH_SIZE,
+        eval_frame = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(timestamps, utc=True),
+                "group": sites,
+                "y_true": y_true,
+                "y_pred": prediction,
+            }
         )
 
-    def _build_dl_model(self, input_size: int):
-        if self.model_type == "lstm":
-            return _build_lstm_net(
-                input_size=input_size,
-                hidden_size=self.LSTM_HIDDEN,
-                num_layers=self.LSTM_LAYERS,
-                dropout=self.LSTM_DROPOUT,
-            )
-        return _build_transformer_net(
-            input_size=input_size,
-            d_model=self.TRANSFORMER_D_MODEL,
-            nhead=self.TRANSFORMER_NHEAD,
-            num_layers=self.TRANSFORMER_LAYERS,
-            dropout=self.TRANSFORMER_DROPOUT,
+        per_group_metrics = {}
+        for group_value, group_df in eval_frame.groupby("group"):
+            group_mae = float(mean_absolute_error(group_df["y_true"], group_df["y_pred"]))
+            group_rmse = float(np.sqrt(mean_squared_error(group_df["y_true"], group_df["y_pred"])))
+            group_mean = float(group_df["y_true"].mean())
+            group_nrmse = group_rmse / group_mean if group_mean != 0 else 0.0
+            per_group_metrics[group_value] = {
+                "mae": group_mae,
+                "rmse": group_rmse,
+                "nrmse": group_nrmse,
+            }
+
+        portfolio = eval_frame.groupby("timestamp", as_index=False)[["y_true", "y_pred"]].sum()
+        n_groups = int(eval_frame["group"].nunique())
+
+        portfolio_mae_total = float(mean_absolute_error(portfolio["y_true"], portfolio["y_pred"]))
+        portfolio_rmse_total = float(np.sqrt(mean_squared_error(portfolio["y_true"], portfolio["y_pred"])))
+        portfolio_mean = float(portfolio["y_true"].mean())
+        portfolio_nrmse_total = portfolio_rmse_total / portfolio_mean if portfolio_mean != 0 else 0.0
+
+        results.update(
+            {
+                "eval_mae": float(mae),
+                "eval_rmse": float(rmse),
+                "eval_nrmse": float(nrmse),
+                "per_group_metrics": per_group_metrics,
+                "per_site_metrics": per_group_metrics,
+                "portfolio_mae_total": float(portfolio_mae_total),
+                "portfolio_rmse_total": float(portfolio_rmse_total),
+                "portfolio_nrmse_total": float(portfolio_nrmse_total),
+                "portfolio_mae_per_group": float(portfolio_mae_total / n_groups if n_groups else 0.0),
+                "portfolio_rmse_per_group": float(portfolio_rmse_total / n_groups if n_groups else 0.0),
+                "portfolio_mae_per_site": float(portfolio_mae_total / n_groups if n_groups else 0.0),
+                "portfolio_rmse_per_site": float(portfolio_rmse_total / n_groups if n_groups else 0.0),
+                "n_groups": n_groups,
+                "n_sites": n_groups,
+            }
         )
-        
-    def _prepare_sequences(self, df, feat_cols, scaler_X, scaler_y, seq_len):
-        """
-        Scaling par site + Fenêtrage NumPy + Recollage global.
-        """
-        print(seq_len)
-        all_X, all_y = [], []
-        
-        for site, grp in df.groupby("site_name"):
-            if len(grp) <= seq_len:
+
+        if plot:
+            self._plot_evaluation(eval_frame)
+
+        self.evaluation_results = results
+        return results
+
+    def save(self, path: Optional[str] = None) -> None:
+        import joblib
+
+        save_path = str(path or self.savepath)
+        if not save_path:
+            raise ValueError("No save path provided")
+        if self.model is None:
+            raise ValueError("No model available to save")
+
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+        if self.model_type in {"lstm", "transformer"}:
+            import torch
+
+            payload = {
+                "model_state_dict": self.model.state_dict(),
+                "feature_columns": self.feature_columns,
+                "input_size": self.input_size,
+                "scaler_X": self.scaler_X,
+                "scaler_y": self.scaler_y,
+            }
+            torch.save(payload, save_path)
+            return
+
+        payload = {
+            "model": self.model,
+            "feature_columns": self.feature_columns,
+        }
+        joblib.dump(payload, save_path)
+
+    def load(self, path: Optional[str] = None) -> None:
+        import joblib
+
+        load_path = str(path or self.savepath)
+        if not load_path:
+            raise ValueError("No load path provided")
+        if not Path(load_path).exists():
+            raise FileNotFoundError(load_path)
+
+        if self.model_type in {"lstm", "transformer"}:
+            import torch
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            payload = torch.load(load_path, map_location=device, weights_only=False)
+            self.feature_columns = list(payload.get("feature_columns", []))
+            self.input_size = payload.get("input_size")
+            self.scaler_X = payload.get("scaler_X")
+            self.scaler_y = payload.get("scaler_y")
+            self.model = self._build_deep_model(self.input_size)
+            self.model.load_state_dict(payload["model_state_dict"])
+            self.model.to(device)
+            self.model.eval()
+            return
+
+        payload = joblib.load(load_path)
+        if isinstance(payload, dict) and "model" in payload:
+            self.model = payload["model"]
+            self.feature_columns = list(payload.get("feature_columns", []))
+        else:
+            self.model = payload
+            self.feature_columns = []
+
+    def _get_tabular_feature_columns(self, df: pd.DataFrame) -> list:
+        return [
+            col
+            for col in df.columns
+            if col not in {self.time_column, self.predict_column, self.group_column}
+        ]
+
+    def _build_tabular_model(self):
+        if self.model_type in {"random_forest", "xgboost", "lightgbm"}:
+            return build_tree_model(self.model_type, self.tree_defaults[self.model_type])
+        if self.model_type == "knn":
+            return build_knn_model(self.knn_defaults)
+        raise ValueError(f"Unsupported tabular model type: {self.model_type}")
+
+    def _train_tabular(self, df: pd.DataFrame) -> None:
+        self.feature_columns = self._get_tabular_feature_columns(df)
+        if not self.feature_columns:
+            raise ValueError("No training features available")
+
+        model = self._build_tabular_model()
+
+        unique_times = np.sort(pd.to_datetime(df[self.time_column], utc=True).unique())
+        splitter = TimeSeriesSplit(n_splits=self.n_splits)
+        fold_maes = []
+
+        for train_idx, val_idx in splitter.split(unique_times):
+            train_dates = set(unique_times[train_idx])
+            val_dates = set(unique_times[val_idx])
+
+            train_df = df[pd.to_datetime(df[self.time_column], utc=True).isin(train_dates)]
+            val_df = df[pd.to_datetime(df[self.time_column], utc=True).isin(val_dates)]
+
+            if train_df.empty or val_df.empty:
                 continue
 
-            X_site_raw = grp[feat_cols].values.astype(np.float32)
-            y_site_raw = grp[self.predict_column].values.astype(
-                np.float32).reshape(-1, 1)
-            
-            cols_to_scale = [
-                c for c in feat_cols if not c.endswith(('sin', 'cos'))]
-            idx_to_scale = [feat_cols.index(c) for c in cols_to_scale]
-            idx_no_scale = [feat_cols.index(c)
-                            for c in feat_cols if c.endswith(('sin', 'cos'))]
+            X_train = train_df[self.feature_columns]
+            y_train = train_df[self.predict_column]
+            X_val = val_df[self.feature_columns]
+            y_val = val_df[self.predict_column]
 
-            X_sc_part = scaler_X.transform(X_site_raw[:, idx_to_scale])
-            X_sc_part = np.clip(X_sc_part, -5.0, 5.0)
-            
-            X_site_sc = np.zeros_like(X_site_raw)
-            X_site_sc[:, idx_to_scale] = X_sc_part
-            X_site_sc[:, idx_no_scale] = X_site_raw[:, idx_no_scale]
-            
-            is_clipped = np.abs(X_site_sc) > 5.0
-            pct_clipped_global = np.mean(is_clipped) * 100
+            fold_model = (
+                build_tree_model(self.model_type, self.tree_defaults[self.model_type])
+                if self.model_type in self.tree_defaults
+                else build_knn_model(self.knn_defaults)
+            )
+            fold_model.fit(X_train, y_train)
+            pred = np.asarray(fold_model.predict(X_val))
+            fold_maes.append(float(mean_absolute_error(y_val, pred)))
 
-            if pct_clipped_global > 1.0:
-                print(
-                    f"  ⚠️ [{site}] {pct_clipped_global:.2f}% des valeurs globales clippées. Détails :")
-                # On calcule le pourcentage de clipping spécifiquement pour chaque colonne
-                pct_per_feature = np.mean(is_clipped, axis=0) * 100
+        X_full = df[self.feature_columns]
+        y_full = df[self.predict_column]
+        model.fit(X_full, y_full)
+        self.model = model
 
-                for i, col_name in enumerate(feat_cols):
-                    # Affiche toute variable qui subit un clipping
-                    if pct_per_feature[i] > 0.0:
-                        print(
-                            f"      -> {col_name} : {pct_per_feature[i]:.2f}% clippé")
+        if fold_maes:
+            self.evaluation_results = {
+                "cv_mae": float(np.mean(fold_maes)),
+                "cv_mae_std": float(np.std(fold_maes)),
+            }
+        else:
+            self.evaluation_results = {
+                "cv_mae": float("nan"),
+                "cv_mae_std": float("nan"),
+            }
 
-            
-            X_site_sc = np.clip(X_site_sc, -5.0, 5.0) #Pour etre sur de pas avoir de valeur aberantes
-            y_site_sc = scaler_y.transform(y_site_raw).ravel()
-            
-            
-            # 3. Fenêtrage glissante
-            for i in range(len(X_site_sc) - seq_len):
-                all_X.append(X_site_sc[i: i + seq_len])
-                all_y.append(y_site_sc[i + seq_len])
+    def _predict_tabular(self, df: pd.DataFrame) -> np.ndarray:
+        if not self.feature_columns:
+            self.feature_columns = self._get_tabular_feature_columns(df)
+        X = df[self.feature_columns]
+        return np.asarray(self.model.predict(X))
+
+    def _get_deep_params(self) -> dict:
+        if self.model_type == "lstm":
+            return self.lstm_params
+        return self.transformer_params
+
+    def _build_deep_model(self, input_size: int):
+        params = self._get_deep_params()
+        if self.model_type == "lstm":
+            return build_lstm_net(
+                input_size=input_size,
+                hidden_size=int(params["hidden_size"]),
+                num_layers=int(params["num_layers"]),
+                dropout=float(params["dropout"]),
+            )
+        return build_transformer_net(
+            input_size=input_size,
+            d_model=int(params["d_model"]),
+            nhead=int(params["nhead"]),
+            num_layers=int(params["num_layers"]),
+            dropout=float(params["dropout"]),
+        )
+
+    def _prepare_deep_sequences(self, df: pd.DataFrame, fit_scalers: bool = False):
+        params = self._get_deep_params()
+        seq_len = int(params["seq_len"])
+
+        local = df.copy()
+        local[self.time_column] = pd.to_datetime(local[self.time_column], utc=True)
+
+        if self.scaler_X is None or self.scaler_y is None:
+            raise ValueError("Scalers are not initialized")
+
+        required_cols = [self.time_column, self.predict_column, self.group_column] + self.feature_columns
+        local = local.dropna(subset=required_cols)
+
+        if fit_scalers:
+            X_all = local[self.feature_columns].to_numpy(dtype=np.float32)
+            y_all = local[[self.predict_column]].to_numpy(dtype=np.float32)
+            self.scaler_X.fit(X_all)
+            self.scaler_y.fit(y_all)
+
+        all_X = []
+        all_y = []
+        all_time = []
+        all_site = []
+
+        for group_value, site_df in local.groupby(self.group_column):
+            site_df = site_df.sort_values(self.time_column)
+            if len(site_df) <= seq_len:
+                continue
+
+            X_site = site_df[self.feature_columns].to_numpy(dtype=np.float32)
+            y_site = site_df[[self.predict_column]].to_numpy(dtype=np.float32)
+            X_scaled = self.scaler_X.transform(X_site)
+            y_scaled = self.scaler_y.transform(y_site).ravel()
+
+            for idx in range(len(site_df) - seq_len):
+                target_idx = idx + seq_len
+                all_X.append(X_scaled[idx:target_idx])
+                all_y.append(y_scaled[target_idx])
+                all_time.append(site_df[self.time_column].iloc[target_idx])
+                all_site.append(group_value)
 
         if not all_X:
-            return np.array([]), np.array([])
+            return np.array([]), np.array([]), np.array([]), np.array([])
 
-        return np.array(all_X), np.array(all_y)
+        X_seq = np.asarray(all_X, dtype=np.float32)
+        y_seq = np.asarray(all_y, dtype=np.float32)
+        times = np.asarray(all_time)
+        sites = np.asarray(all_site)
+        return X_seq, y_seq, times, sites
 
-    def _train_deep(self, df: pd.DataFrame, no_cv=False):
-        import copy
+    def _train_deep(self, df: pd.DataFrame, no_cv: bool = False) -> None:
         import torch
         import torch.nn as nn
-        from torch.utils.data import TensorDataset, DataLoader
-        
+        from torch.utils.data import DataLoader, TensorDataset
+
+        self.feature_columns = self._get_tabular_feature_columns(df)
+        if not self.feature_columns:
+            raise ValueError("No training features available")
+
+        self.scaler_X = StandardScaler()
+        self.scaler_y = MinMaxScaler(feature_range=(0, 1))
+
+        X_seq, y_seq, _, _ = self._prepare_deep_sequences(df, fit_scalers=True)
+        if len(X_seq) == 0:
+            raise ValueError("Not enough rows to create deep-learning sequences")
+
+        self.input_size = int(X_seq.shape[2])
+        self.model = self._build_deep_model(self.input_size)
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"[{self.model_type}] Utilisation de : {device}")
+        self.model.to(device)
 
+        params = self._get_deep_params()
+        epochs = int(params["epochs"])
+        batch_size = int(params["batch_size"])
+        learning_rate = float(params["learning_rate"])
+        weight_decay = float(params.get("weight_decay", 0.0))
+        patience = int(params.get("patience", 8))
+        grad_clip = float(params.get("grad_clip", 0.0))
+        val_fraction = float(params.get("val_fraction", 0.2))
+        val_fraction = min(max(val_fraction, 0.05), 0.5)
 
-        feat_cols = [c for c in df.columns if c not in (
-            self.time_column,
-            self.predict_column,
-            'site_name'
-        )]
-        print(f"Feat cols:  {feat_cols}")
-        
-        params = self._get_dl_params()
-        seq_len = params["seq_len"]
-        # Need to keep unique times in distinct splits (each site has a row for each time)
-        unique_times = np.sort(df[self.time_column].unique())
-        tscv = TimeSeriesSplit(n_splits=self.n_splits, gap=seq_len)
-
-        print(f"NO CV: {no_cv}")
-        if not no_cv:
-            fold_maes, fold_best_epochs = [], []
-
-            for fold, (train_idx, val_idx) in enumerate(tscv.split(unique_times)):
-                print(f"\n--- Cross validation Fold {fold+1}/{self.n_splits} ---")
-
-                train_dates = unique_times[train_idx]
-                val_dates = unique_times[val_idx]
-                # Contexte : les seq_len heures juste avant la validation
-                if val_idx[0] < seq_len:
-                    print(
-                        f"   [fold {fold+1}] Pas assez d'historique, fold ignoré.")
-                    continue
-                ctx_dates = unique_times[val_idx[0] - seq_len: val_idx[0]]
-
-                df_train = df[df[self.time_column].isin(train_dates)]
-                df_val_raw = df[df[self.time_column].isin(val_dates)]
-                df_ctx = df[df[self.time_column].isin(ctx_dates)]
-
-                X_tr_raw, y_tr_raw, _ = self._to_arrays(
-                    df_train, feat_cols, self.predict_column)
-
-
-                idx_to_scale = [i for i, c in enumerate(
-                    feat_cols) if not c.endswith(('sin', 'cos'))]
-
-                scaler_X_fold = StandardScaler().fit(X_tr_raw[:, idx_to_scale])
-                
-                scaler_y_fold = MinMaxScaler(feature_range=(0, 1)).fit(y_tr_raw.reshape(-1, 1))
-
-                X_tr_seq, y_tr_seq = self._prepare_sequences(
-                    df_train, feat_cols, scaler_X_fold, scaler_y_fold, seq_len)
-
-                df_val_with_ctx = pd.concat([df_ctx, df_val_raw])
-                X_val_seq, y_val_seq = self._prepare_sequences(
-                    df_val_with_ctx, feat_cols, scaler_X_fold, scaler_y_fold, seq_len)
-
-                if self.verbose:
-                    print(f"   Dates Train : {train_dates[0]} au {train_dates[-1]}")
-                    print(f"   Lignes Train brutes : {len(df_train)}")
-                    print(f"   Séquences LSTM Train: {X_tr_seq.shape[0]}")
-                    print(f"   Séquences LSTM Val  : {X_val_seq.shape[0]}")
-
-                if len(X_tr_seq) == 0:
-                    continue
-
-                # Modèle frais pour chaque fold
-                net = self._build_dl_model(X_tr_seq.shape[2]).to(device)
-                opt = torch.optim.Adam(
-                    net.parameters(), lr=self.DL_LR, weight_decay=1e-5)
-                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    opt, mode='min', patience=5, factor=0.5, min_lr=1e-6
-                )
-                loss_fn = nn.MSELoss()
-                
-                if self.verbose:      
-                    print(f"DEBUG SCALING - Fold {fold+1}")
-                    print(
-                        f"X_tr_seq MIN: {X_tr_seq.min():.2f} | MAX: {X_tr_seq.max():.2f} | MEAN: {X_tr_seq.mean():.2f}")
-                
-                train_loader = DataLoader(
-                    TensorDataset(torch.from_numpy(X_tr_seq),
-                                torch.from_numpy(y_tr_seq)),
-                    batch_size=params["batch"], shuffle=True,
-                )
-                val_loader = DataLoader(
-                    TensorDataset(torch.from_numpy(X_val_seq),
-                                torch.from_numpy(y_val_seq)),
-                    batch_size=params["batch"], shuffle=False,
-                )
-
-                best_val_loss = float("inf")
-                best_epoch = 0
-                patience_cnt = 0
-                best_state = None
-                patience = getattr(self, "DL_PATIENCE", 20)
-                grad_clip = getattr(self, "DL_GRAD_CLIP", 1.0)
-
-                if self.verbose:
-                    print(f"patience: {patience}")
-                    print(f"grad clip: {grad_clip}")
-                pbar = tqdm(range(1, params["epochs"] + 1), desc=f"Fold {fold+1}", disable=not self.verbose)
-                for epoch in pbar:
-                    train_loss = 0.0
-
-                    train_preds_list = []
-                    train_true_list = []
-                    net.train()
-                    for xb, yb in train_loader:
-                        xb, yb = xb.to(device), yb.to(device)
-                        opt.zero_grad()
-                        pred = net(xb)
-                        loss = loss_fn(pred, yb)
-                        loss.backward()
-                        if grad_clip > 0:
-                            nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
-                        opt.step()
-                        train_loss += loss.item()
-
-                        train_preds_list.append(pred.detach().cpu().numpy())
-                        train_true_list.append(yb.cpu().numpy())
-                        
-                    train_loss /= len(train_loader)
-
-                    train_preds_all = scaler_y_fold.inverse_transform(
-                        np.concatenate(train_preds_list).reshape(-1, 1)).ravel()
-                    train_true_all = scaler_y_fold.inverse_transform(
-                        np.concatenate(train_true_list).reshape(-1, 1)).ravel()
-                    tr_mae = mean_absolute_error(train_true_all, train_preds_all)
-                    
-                    net.eval()
-                    val_loss = 0.0
-                    val_preds_list = []
-                    val_true_list = []
-
-                    with torch.no_grad():
-                        for xb, yb in val_loader:
-                            xb, yb = xb.to(device), yb.to(device)
-                            pred = net(xb)
-                            val_loss += loss_fn(pred, yb).item()
-                            val_preds_list.append(pred.cpu().numpy())
-                            val_true_list.append(yb.cpu().numpy())
-                    val_loss /= len(val_loader) 
-                    val_preds_all = scaler_y_fold.inverse_transform(
-                        np.concatenate(val_preds_list).reshape(-1, 1)).ravel()
-                    val_true_all = scaler_y_fold.inverse_transform(
-                        np.concatenate(val_true_list).reshape(-1, 1)).ravel()
-                    val_mae = mean_absolute_error(val_true_all, val_preds_all)
-                    scheduler.step(val_loss)
-                    
-                    
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        best_epoch = epoch
-                        best_state = copy.deepcopy(net.state_dict())
-                        # On voit l'époque qui gagne
-                        pbar.set_description(f"Fold {fold+1} (Best: {epoch})")
-                        pbar.refresh()
-                        pbar.set_postfix({
-                            "tr_loss": f"{train_loss:.4f}",
-                            "val_loss": f"{val_loss:.4f}",
-                            "tr_mae": f"{tr_mae:.4f}",
-                            "val_mae": f"{val_mae:.4f}",
-                            "best": best_epoch
-                        })
-
-                        pbar.refresh()
-                        patience_cnt = 0
-                    else:
-                        patience_cnt += 1
-                        if patience_cnt >= patience:
-                            break
-
-                # Loading the best model for this fold to evaluate on the val set
-                if best_state is not None:
-                    net.load_state_dict(best_state)
-                net.eval()
-                preds_chunks = []
-                with torch.no_grad():
-
-                    for i in range(0, len(X_val_seq), params["batch"]):
-                        chunk = torch.from_numpy(X_val_seq[i:i+params["batch"]]).to(device)
-                        preds_chunks.append(net(chunk).cpu().numpy())
-                        preds_sc = np.concatenate(preds_chunks)
-
-                preds = scaler_y_fold.inverse_transform(
-                    preds_sc.reshape(-1, 1)).ravel()
-                truth = scaler_y_fold.inverse_transform(
-                    y_val_seq.reshape(-1, 1)).ravel()
-                fold_mae = float(mean_absolute_error(truth, preds))
-
-                fold_maes.append(fold_mae)
-                fold_best_epochs.append(best_epoch)
-                print(f"  [{self.model_type}] fold {fold+1} | MAE: {fold_mae:.4f} | best epoch: {best_epoch}")
-
-            cv_mae = float(np.mean(fold_maes)) if fold_maes else float("nan")
-            # Médiane des best epochs — plus robuste que la moyenne aux folds extrêmes
-            refit_epochs = refit_epochs = int(np.median(fold_best_epochs[-3:])) if fold_best_epochs else params["epochs"]
-            print(f"\n[{self.model_type}] CV MAE: {cv_mae:.4f} ± {np.std(fold_maes):.4f}")
-            print(f"[{self.model_type}] Refit sur {refit_epochs} epochs (médiane des best epochs par fold)")
-
-            self.evaluation_results = {
-                "cv_mae":      cv_mae,
-                "cv_mae_std":  float(np.std(fold_maes)),
-                "refit_epochs": refit_epochs,
-            }
-        
+        if no_cv or len(X_seq) < 20:
+            X_train = X_seq
+            y_train = y_seq
+            X_val = np.array([])
+            y_val = np.array([])
         else:
-            refit_epochs = self.DL_EPOCHS
-            self.evaluation_results = {"cv_mae": float(
-                "nan"), "cv_mae_std": float("nan"), "refit_epochs": refit_epochs}
-            print(f"[{self.model_type}] CV désactivé, refit sur {refit_epochs} epochs")
+            val_size = max(1, int(val_fraction * len(X_seq)))
+            X_train = X_seq[:-val_size]
+            y_train = y_seq[:-val_size]
+            X_val = X_seq[-val_size:]
+            y_val = y_seq[-val_size:]
 
-
-        X_raw, y_raw, _ = self._to_arrays(df, feat_cols, self.predict_column)
-
-
-        if not self.scaler_X or not self.scaler_y:
-            raise ValueError("Scalers where not defined properly")
-
-        idx_to_scale = [i for i, c in enumerate(
-            feat_cols) if not c.endswith(('sin', 'cos'))]
-
-        self.scaler_X.fit(X_raw[:, idx_to_scale])
-        self.scaler_y.fit(y_raw.reshape(-1, 1))
-
-        X_seq, y_seq = self._prepare_sequences(
-            df, feat_cols, self.scaler_X, self.scaler_y, seq_len
-        )
-
-        self.input_size = X_seq.shape[2]
-        self.model = self._build_dl_model(self.input_size).to(device)
-        opt = torch.optim.Adam(self.model.parameters(),
-                               lr=self.DL_LR, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, mode='min', patience=5, factor=0.5, min_lr=1e-6
-        )
-        loss_fn = nn.MSELoss()
-        grad_clip = getattr(self, "DL_GRAD_CLIP", 1.0)
-
-        print(f"--- FINAL REFIT INFO ---")
-        print(f"Séquences totales pour entraînement final : {X_seq.shape[0]}")
-
-        loader = DataLoader(
-            TensorDataset(torch.from_numpy(X_seq), torch.from_numpy(y_seq)),
-            batch_size=params["batch"], 
+        train_loader = DataLoader(
+            TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
+            batch_size=batch_size,
             shuffle=True,
-            num_workers=4,      # parallélise le chargement
-            pin_memory=True,    # accélère le transfert CPU→GPU si GPU dispo
-            persistent_workers=True  # évite de recréer les workers à chaque epoch
-            
         )
 
-        loss_history = {"train": [], "eval": []}
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-        self.model.train()
-        for epoch in tqdm(range(1, refit_epochs + 1), disable=not self.verbose):
-            epoch_loss = 0.0
-            preds_list = []
-            true_list = []
-            for xb, yb in tqdm(loader, desc=f"  epoch {epoch}", leave=False, disable=not self.verbose):
-                xb, yb = xb.to(device), yb.to(device)
-                opt.zero_grad()
+        best_state = None
+        best_val_loss = float("inf")
+        stalled = 0
+
+        for _ in range(epochs):
+            self.model.train()
+            for xb, yb in train_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                optimizer.zero_grad()
                 pred = self.model(xb)
-                loss = loss_fn(pred, yb)
+                loss = criterion(pred, yb)
                 loss.backward()
                 if grad_clip > 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-                opt.step()
-                epoch_loss += loss.item()
-                preds_list.append(pred.detach().cpu().numpy())
-                true_list.append(yb.cpu().numpy())
-            avg_loss = epoch_loss / len(loader)
-            scheduler.step(avg_loss)
-            loss_history["train"].append(avg_loss)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                optimizer.step()
 
-            tr_preds = self.scaler_y.inverse_transform(
-                np.concatenate(preds_list).reshape(-1, 1)).ravel()
-            tr_true = self.scaler_y.inverse_transform(
-                np.concatenate(true_list).reshape(-1, 1)).ravel()
-            tr_mae = mean_absolute_error(tr_true, tr_preds)
-            if self.verbose:
-                print(f"  [refit] epoch {epoch}/{refit_epochs} | loss: {avg_loss:.6f} | MAE train: {tr_mae:.4f}")
+            if len(X_val) == 0:
+                continue
 
-        print('end')
-        # Pas de val loss pendant le refit — on n'a pas de set de val dédié
-        return loss_history
+            self.model.eval()
+            with torch.no_grad():
+                pred_val = self.model(torch.from_numpy(X_val).to(device)).cpu().numpy()
+            val_loss = float(np.mean((pred_val - y_val) ** 2))
 
-    def _predict_deep(self, df: pd.DataFrame) -> np.ndarray:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = deepcopy(self.model.state_dict())
+                stalled = 0
+            else:
+                stalled += 1
+                if stalled >= patience:
+                    break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+
+        if len(X_val) > 0:
+            self.model.eval()
+            with torch.no_grad():
+                pred_val = self.model(torch.from_numpy(X_val).to(device)).cpu().numpy()
+            pred_val = self.scaler_y.inverse_transform(pred_val.reshape(-1, 1)).ravel()
+            true_val = self.scaler_y.inverse_transform(y_val.reshape(-1, 1)).ravel()
+            mae = float(mean_absolute_error(true_val, pred_val))
+            self.evaluation_results = {"cv_mae": mae, "cv_mae_std": 0.0}
+        else:
+            self.evaluation_results = {"cv_mae": float("nan"), "cv_mae_std": float("nan")}
+
+    def _predict_deep(self, df: pd.DataFrame):
         import torch
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        params = self._get_dl_params()
-        seq_len = params["seq_len"]
 
-        feat_cols = [c for c in df.columns if c not in (
-            self.time_column,
-            self.predict_column,
-            'site_name'
-        )]
-        print(feat_cols)
-        X_seq, y_true_sc = self._prepare_sequences(
-            df, feat_cols, self.scaler_X, self.scaler_y, seq_len
-        )
+        if self.model is None:
+            raise ValueError("Model is not trained or loaded")
+        if self.scaler_X is None or self.scaler_y is None:
+            raise ValueError("Scalers are not available")
 
+        X_seq, y_seq, times, sites = self._prepare_deep_sequences(df, fit_scalers=False)
         if len(X_seq) == 0:
-            return np.array([])
+            return np.array([]), np.array([]), np.array([]), np.array([])
 
-        self.model.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(device)
-        preds_chunks = []
-        with torch.no_grad():
-            for i in range(0, len(X_seq), 2048):
-                chunk = torch.from_numpy(X_seq[i:i+2048]).to(device)
-                preds_chunks.append(self.model(chunk).cpu().numpy())
-        preds_sc = np.concatenate(preds_chunks)
+        self.model.eval()
 
-        preds = self.scaler_y.inverse_transform(
-        preds_sc.reshape(-1, 1)).ravel()
-        y_true = self.scaler_y.inverse_transform(y_true_sc.reshape(-1, 1)).ravel()
-        
-        return preds, y_true
+        preds = []
+        with torch.no_grad():
+            for start in range(0, len(X_seq), 2048):
+                end = start + 2048
+                batch = torch.from_numpy(X_seq[start:end]).to(device)
+                preds.append(self.model(batch).cpu().numpy())
+
+        pred_scaled = np.concatenate(preds).reshape(-1, 1)
+        pred = self.scaler_y.inverse_transform(pred_scaled).ravel()
+        y_true = self.scaler_y.inverse_transform(y_seq.reshape(-1, 1)).ravel()
+        return pred, y_true, times, sites
+
+    def _plot_evaluation(self, eval_frame: pd.DataFrame) -> None:
+        import matplotlib.pyplot as plt
+
+        plot_df = eval_frame.sort_values("timestamp")
+        fig, ax = plt.subplots(figsize=(16, 6))
+        ax.plot(plot_df["timestamp"], plot_df["y_true"], label="actual", linewidth=1)
+        ax.plot(plot_df["timestamp"], plot_df["y_pred"], label="predicted", linewidth=1)
+        ax.legend()
+        ax.set_title(f"Evaluation - {self.model_type}")
+        plt.tight_layout()
+        plt.show()
