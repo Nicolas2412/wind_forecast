@@ -1,8 +1,11 @@
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from matplotlib import pyplot as plt
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from copy import deepcopy
 from copy import deepcopy
 
 from sklearn.metrics import mean_absolute_error
@@ -111,13 +114,117 @@ _APP_CONFIG = _load_config()
 VALID_MODELS = _APP_CONFIG["valid_models"]
 MODEL_PARAMS = _APP_CONFIG["model_params"]
 DEFAULT_MODEL_TYPE = VALID_MODELS[0]
+from tqdm import tqdm
+
+DEFAULT_TEST_SIZE = 0.2
+
+SUPPORTED_MODELS = ["random_forest", "xgboost", "lightgbm", "sarimax", "lstm", "transformer"]
+
+DEFAULT_MODEL_PARAMS = {
+    "random_forest": {
+        "n_estimators": 200,
+        "random_state": 42,
+        "n_jobs": -1,
+    },
+    "xgboost": {
+        "n_estimators": 200,
+        "random_state": 42,
+        "n_jobs": -1,
+        "tree_method": "hist",
+    },
+    "lightgbm": {
+        "n_estimators": 200,
+        "random_state": 42,
+        "n_jobs": -1,
+        "verbose": -1,
+    },
+    "sarimax": {
+        "order": [1, 1, 1],
+        "seasonal_order": [1, 1, 1, 24],
+        "enforce_stationarity": False,
+        "enforce_invertibility": False,
+    },
+    "lstm": {
+        "seq_len": 48,
+        "hidden_size": 128,
+        "num_layers": 2,
+        "dropout": 0.2,
+        "epochs": 30,
+        "batch_size": 256,
+        "learning_rate": 1e-3,
+    },
+    "transformer": {
+        "seq_len": 48,
+        "d_model": 64,
+        "nhead": 4,
+        "num_layers": 2,
+        "dropout": 0.1,
+        "epochs": 30,
+        "batch_size": 256,
+        "learning_rate": 1e-3,
+    },
+}
+
+
+def _load_config(config_path: str = "config.yaml") -> dict:
+    config_file = Path(config_path)
+    if not config_file.is_absolute():
+        config_file = Path(__file__).resolve().parent / config_file
+    if not config_file.exists():
+        return {
+            "valid_models": SUPPORTED_MODELS,
+            "model_params": deepcopy(DEFAULT_MODEL_PARAMS),
+        }
+
+    try:
+        import yaml
+    except ImportError:
+        return {
+            "valid_models": SUPPORTED_MODELS,
+            "model_params": deepcopy(DEFAULT_MODEL_PARAMS),
+        }
+
+    try:
+        with config_file.open("r", encoding="utf-8") as file:
+            raw = yaml.safe_load(file) or {}
+    except Exception:
+        raw = {}
+
+    config_valid_models = raw.get("valid_models", SUPPORTED_MODELS)
+    valid_models = [
+        model_name
+        for model_name in config_valid_models
+        if model_name in SUPPORTED_MODELS
+    ]
+    if not valid_models:
+        valid_models = list(SUPPORTED_MODELS)
+
+    model_params = deepcopy(DEFAULT_MODEL_PARAMS)
+    loaded_model_params = raw.get("model_params", {})
+    if isinstance(loaded_model_params, dict):
+        for model_name, params in loaded_model_params.items():
+            if model_name in model_params and isinstance(params, dict):
+                model_params[model_name].update(params)
+
+    return {
+        "valid_models": valid_models,
+        "model_params": model_params,
+    }
+
+
+_APP_CONFIG = _load_config()
+VALID_MODELS = _APP_CONFIG["valid_models"]
+MODEL_PARAMS = _APP_CONFIG["model_params"]
+DEFAULT_MODEL_TYPE = VALID_MODELS[0]
 
 # ---------------------------------------------------------------------------
 # PyTorch helpers (imported lazily inside the classes that need them)
 # ---------------------------------------------------------------------------
 
 
+
 def _build_lstm_net(input_size: int, hidden_size: int, num_layers: int, dropout: float):
+    """Build a PyTorch LSTM regressor with custom weight initialization."""
     """Build a PyTorch LSTM regressor with custom weight initialization."""
     import torch
     import torch.nn as nn
@@ -215,13 +322,22 @@ def _build_transformer_net(input_size: int, d_model: int, nhead: int,
 class DataProcessor:
     """Data Processing class."""
 
-    def __init__(self, path_folder: str, X: pd.DataFrame = None, drop_columns: list = ["site_name"]):
+    def __init__(self, path_folder: str, X: pd.DataFrame = None, drop_columns: list = []):
         self.path = path_folder
         self.time_column = "delivery_time"
         self.predict_column = "production_normalized"
         self.drop_columns = list(set(
             drop_columns + ['production', 'installed_capacity', 'is_not_plateau']))
+        self.drop_columns = list(set(
+            drop_columns + ['production', 'installed_capacity', 'is_not_plateau']))
         self.df = self.open_data() if X is None else X
+        
+    def run(self) -> pd.DataFrame:
+        """Run the full processing pipeline."""
+        df = self.prepocess_data()
+        df = self.impute_production(df)
+        df = self.engineer_features(df)
+        return df
         
     def run(self) -> pd.DataFrame:
         """Run the full processing pipeline."""
@@ -265,6 +381,8 @@ class DataProcessor:
 
         df["production_normalized"] = df["production"] / df["installed_capacity"]
 
+        df = compute_plateau(df=df, N=N, window=window, tolerance=tolerance, low_thresh=low_thresh, high_thresh=high_thresh)
+        
         df = compute_plateau(df=df, N=N, window=window, tolerance=tolerance, low_thresh=low_thresh, high_thresh=high_thresh)
         
         self.df = df
@@ -381,12 +499,17 @@ class DataProcessor:
         # Evite les gros pics
         df['precipitation'] = np.log1p(df['precipitation'])
         
+
+        # Evite les gros pics
+        df['precipitation'] = np.log1p(df['precipitation'])
+        
         df["production_normalized"] = df["production"] / df["installed_capacity"]
 
         df["wind_speed_diff"]  = df["wind_speed_100m"] - df["wind_speed_10m"]
         for col in ["wind_speed_10m", "wind_speed_100m"]:
             df[f"{col}_squared"] = df[col] ** 2
             df[f"{col}_cubed"]   = df[col] ** 3
+            
             
         df["wind_speed_ratio"] = df["wind_speed_100m"] / (df["wind_speed_10m"] + 1e-8)
         v10 = df["wind_speed_10m"].clip(lower=0.5)
@@ -498,7 +621,10 @@ def compute_plateau(df: pd.DataFrame, N: int = 5, window: str = "24h", tolerance
 
         results.append(df_site.drop(columns=["similar_count"]).reset_index())
         
+        results.append(df_site.drop(columns=["similar_count"]).reset_index())
+        
     return pd.concat(results, ignore_index=True)
+
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +716,12 @@ class ForecastModel:
         from sklearn.metrics import mean_absolute_error, mean_squared_error
         import numpy as np
 
+    def evaluate(self, df: pd.DataFrame = None, plot: bool = False) -> dict:
+        from sklearn.metrics import mean_absolute_error, mean_squared_error
+        import numpy as np
+
         results = dict(self.evaluation_results)
+        results["per_site_metrics"] = {}
         results["per_site_metrics"] = {}
         if df is not None:
             if self.model_type in ['lstm', 'transformer']:
@@ -771,11 +902,14 @@ class ForecastModel:
 
         return results
     
+    
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         """Predict on a new DataFrame."""
+        """Predict on a new DataFrame."""
         if self.model is None:
             raise ValueError("Model has not been trained yet.")
+
 
         dispatch = {
             "random_forest": self._predict_sklearn,
@@ -864,6 +998,7 @@ class ForecastModel:
                 random_state=self.SKLEARN_DEFAULTS["random_state"],
                 n_jobs=self.SKLEARN_DEFAULTS["n_jobs"],
                 tree_method=self.XGBOOST_TREE_METHOD,
+                tree_method=self.XGBOOST_TREE_METHOD,
             )
         if self.model_type == "lightgbm":
             from lightgbm import LGBMRegressor
@@ -871,6 +1006,52 @@ class ForecastModel:
                 n_estimators=self.SKLEARN_DEFAULTS["n_estimators"],
                 random_state=self.SKLEARN_DEFAULTS["random_state"],
                 n_jobs=self.SKLEARN_DEFAULTS["n_jobs"],
+                verbose=self.LIGHTGBM_VERBOSE,
+            )
+
+    def _apply_model_params_from_config(self) -> None:
+        params = MODEL_PARAMS.get(self.model_type, {})
+
+        if self.model_type in ("random_forest", "xgboost", "lightgbm"):
+            for key in ("n_estimators", "random_state", "n_jobs"):
+                if key in params:
+                    self.SKLEARN_DEFAULTS[key] = params[key]
+            if self.model_type == "xgboost" and "tree_method" in params:
+                self.XGBOOST_TREE_METHOD = params["tree_method"]
+            if self.model_type == "lightgbm" and "verbose" in params:
+                self.LIGHTGBM_VERBOSE = params["verbose"]
+            return
+
+        if self.model_type == "sarimax":
+            if "order" in params:
+                self.SARIMAX_ORDER = tuple(params["order"])
+            if "seasonal_order" in params:
+                self.SARIMAX_SEAS_ORDER = tuple(params["seasonal_order"])
+            if "enforce_stationarity" in params:
+                self.SARIMAX_ENFORCE_STATIONARITY = params["enforce_stationarity"]
+            if "enforce_invertibility" in params:
+                self.SARIMAX_ENFORCE_INVERTIBILITY = params["enforce_invertibility"]
+            return
+
+        if self.model_type == "lstm":
+            self.LSTM_SEQ_LEN = params.get("seq_len", self.LSTM_SEQ_LEN)
+            self.LSTM_HIDDEN = params.get("hidden_size", self.LSTM_HIDDEN)
+            self.LSTM_LAYERS = params.get("num_layers", self.LSTM_LAYERS)
+            self.LSTM_DROPOUT = params.get("dropout", self.LSTM_DROPOUT)
+            self.DL_EPOCHS = params.get("epochs", self.DL_EPOCHS)
+            self.DL_BATCH_SIZE = params.get("batch_size", self.DL_BATCH_SIZE)
+            self.DL_LR = params.get("learning_rate", self.DL_LR)
+            return
+
+        if self.model_type == "transformer":
+            self.TRANSFORMER_SEQ_LEN = params.get("seq_len", self.TRANSFORMER_SEQ_LEN)
+            self.TRANSFORMER_D_MODEL = params.get("d_model", self.TRANSFORMER_D_MODEL)
+            self.TRANSFORMER_NHEAD = params.get("nhead", self.TRANSFORMER_NHEAD)
+            self.TRANSFORMER_LAYERS = params.get("num_layers", self.TRANSFORMER_LAYERS)
+            self.TRANSFORMER_DROPOUT = params.get("dropout", self.TRANSFORMER_DROPOUT)
+            self.DL_EPOCHS = params.get("epochs", self.DL_EPOCHS)
+            self.DL_BATCH_SIZE = params.get("batch_size", self.DL_BATCH_SIZE)
+            self.DL_LR = params.get("learning_rate", self.DL_LR)
                 verbose=self.LIGHTGBM_VERBOSE,
             )
 
@@ -990,6 +1171,8 @@ class ForecastModel:
                     seasonal_order=self.SARIMAX_SEAS_ORDER,
                     enforce_stationarity=self.SARIMAX_ENFORCE_STATIONARITY,
                     enforce_invertibility=self.SARIMAX_ENFORCE_INVERTIBILITY,
+                    enforce_stationarity=self.SARIMAX_ENFORCE_STATIONARITY,
+                    enforce_invertibility=self.SARIMAX_ENFORCE_INVERTIBILITY,
                 ).fit(disp=False)
                 preds = res.forecast(steps=len(val_s))
                 maes.append(mean_absolute_error(val_s, preds))
@@ -1006,6 +1189,8 @@ class ForecastModel:
             seasonal_order=self.SARIMAX_SEAS_ORDER,
             enforce_stationarity=self.SARIMAX_ENFORCE_STATIONARITY,
             enforce_invertibility=self.SARIMAX_ENFORCE_INVERTIBILITY,
+            enforce_stationarity=self.SARIMAX_ENFORCE_STATIONARITY,
+            enforce_invertibility=self.SARIMAX_ENFORCE_INVERTIBILITY,
         ).fit(disp=False)
 
     def _predict_sarimax(self, df: pd.DataFrame) -> np.ndarray:
@@ -1016,6 +1201,13 @@ class ForecastModel:
     # ------------------------------------------------------------------
     # Deep-learning helpers (LSTM & Transformer share the same loop)
     # ------------------------------------------------------------------
+
+    def _to_arrays(self, frame, feat_cols, target_col):
+        # Juste pour transformer un DF en matrice numpy propre pour les scalers
+        mask = frame[feat_cols].notna().all(
+            axis=1) & frame[target_col].notna()
+        f = frame[mask]
+        return f[feat_cols].values.astype(np.float32), f[target_col].values.astype(np.float32), mask
 
     def _to_arrays(self, frame, feat_cols, target_col):
         # Juste pour transformer un DF en matrice numpy propre pour les scalers
