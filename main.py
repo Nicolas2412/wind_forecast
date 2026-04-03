@@ -11,6 +11,7 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
         savepath:str = None,
         drop_prod:bool = False,
         no_cv:bool = False,
+        seq_len:int = 48,
         on_nine_sites : bool = False,
         skip_train:bool = False,
         verbose:bool = False):
@@ -95,7 +96,7 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
         sys.exit(1)
 
     # --- ENTRAINEMENT ---
-    forecastModel = ForecastModel(model_type=model_type, savepath=savepath, verbose=verbose)
+    forecastModel = ForecastModel(model_type=model_type, savepath=savepath, verbose=verbose, seq_len=seq_len)
 
     if skip_train:
         if forecastModel.model is None:
@@ -144,6 +145,18 @@ def main(test_size: float = DEFAULT_TEST_SIZE,
     print(f"{'PORTEFEUILLE (Moy/Site)':<35} | {p_mae_site:<10.4f} | {p_rmse_site:<10.4f} | Gain Foisonnement")
     print("="*85 + "\n")
 
+    metrics = {
+        'eval_mae': eval_results['eval_mae'],
+        'eval_rmse': eval_results['eval_rmse'],
+        'eval_nrmse': eval_results['eval_nrmse'],
+        'portfolio_mae_total': eval_results.get('portfolio_mae_total', None),
+        'portfolio_rmse_total': eval_results.get('portfolio_rmse_total', None),
+        'portfolio_nrmse_total': eval_results.get('portfolio_nrmse_total', None),
+        'portfolio_mae_per_site': eval_results.get('portfolio_mae_per_site', None),
+        'portfolio_rmse_per_site': eval_results.get('portfolio_rmse_per_site', None)
+    }
+
+    return metrics
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run general model pipeline.")
@@ -190,6 +203,9 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--name", type=str, default="testModel",
                         help="Nom du fichier de sauvegarde (sans extension)")
     
+    parser.add_argument("--seq_len", type=int, default=48,
+                        help="Longueur de la séquence pour les modèles LSTM/Transformer")
+    
     args = parser.parse_args()
     
     if args.unique_site:
@@ -219,6 +235,7 @@ if __name__ == "__main__":
         savepath=savepath,
         drop_prod=args.drop_prod,
         no_cv=args.no_cv,
+        seq_len=args.seq_len,
         skip_train=args.skip_train,
         on_nine_sites=args.on_nine_sites,
         verbose=args.verbose)
