@@ -1,0 +1,177 @@
+valid_models:
+  - random_forest
+  - xgboost
+  - lightgbm
+  - knn
+  - lstm
+  - transformer
+
+model_params:
+  random_forest:
+    n_estimators: 200
+    random_state: 42
+    n_jobs: -1
+    criterion: squared_error
+    max_depth: null
+    min_samples_split: 2
+    min_samples_leaf: 1
+    min_weight_fraction_leaf: 0.0
+    max_features: 1.0
+    max_leaf_nodes: null
+    min_impurity_decrease: 0.0
+    bootstrap: true
+    oob_score: false
+    ccp_alpha: 0.0
+    max_samples: null
+
+  xgboost:
+    n_estimators: 200
+    random_state: 42
+    n_jobs: -1
+    tree_method: hist
+    learning_rate: 0.05
+    max_depth: 6
+    min_child_weight: 1
+    subsample: 0.8
+    colsample_bytree: 0.8
+    colsample_bylevel: 1.0
+    colsample_bynode: 1.0
+    gamma: 0.0
+    reg_alpha: 0.0
+    reg_lambda: 1.0
+    objective: reg:squarederror
+    eval_metric: rmse
+
+  lightgbm:
+    n_estimators: 200
+    random_state: 42
+    n_jobs: -1
+    verbose: -1
+    learning_rate: 0.05
+    boosting_type: gbdt
+    num_leaves: 63
+    max_depth: -1
+    min_child_samples: 20
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_alpha: 0.0
+    reg_lambda: 0.0
+    min_split_gain: 0.0
+    objective: regression
+
+  knn:
+    n_neighbors: 25
+    weights: distance
+    n_jobs: -1
+    algorithm: auto
+    leaf_size: 30
+    p: 2
+    metric: minkowski
+
+  lstm:
+    seq_len: 168
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.3
+    epochs: 50
+    batch_size: 256
+    learning_rate: 0.00005
+    weight_decay: 0.0
+    patience: 8
+    grad_clip: 0.0
+    val_fraction: 0.2
+
+  transformer:
+    seq_len: 8
+    d_model: 128
+    nhead: 8
+    num_layers: 3
+    dropout: 0.2
+    epochs: 50
+    batch_size: 256
+    learning_rate: 0.0001
+    weight_decay: 0.0
+    patience: 8
+    grad_clip: 0.0
+    val_fraction: 0.2
+
+backbone:
+  data:
+    folder: data/
+    file_pattern: dataset_*.parquet
+    exclude_files:
+      - dataset_2
+
+  schema:
+    time_column: delivery_time
+    group_column: site_name
+    target_column: production_normalized
+    raw_target_column: production
+    capacity_column: installed_capacity
+
+  preprocessing:
+    drop_columns:
+      - production
+      - installed_capacity
+      - wind_speed_ratio
+      - snowfall
+      - shortwave_radiation
+      - direct_radiation
+      - diffuse_radiation
+      - sunshine_duration
+      - dewpoint_2m
+      - apparent_temperature
+      - wind_direction_100m
+      - wind_direction_10m
+      - weather_code
+      - cloud_cover_low
+      - cloud_cover_mid
+      - cloud_cover_high
+      - is_weekend
+      - is_night
+      - hour
+      - day_of_week
+      - month
+      - is_not_plateau
+    drop_prod_columns:
+      - production_lag360h
+      - production_lag384h
+      - production_lag720h
+      - production_rolling_mean_7d
+      - production_rolling_std_7d
+      - production_rolling_mean_14d
+      - production_rolling_std_14d
+    plateau:
+      enabled: true
+      N: 5
+      window: 24h
+      tolerance: 0.01
+      low_thresh: 0.1
+      high_thresh: 0.9
+    imputation:
+      enabled: true
+      max_gap_hours: 6
+    feature_engineering:
+      time_features: true
+      weather_features: true
+      lag_features: true
+      data_delay_days: 15
+
+  postprocess:
+    clip_rules:
+      - contains_any:
+          - wind_speed
+          - wind_gusts
+        lower: 0.0
+        upper: 45.0
+      - columns:
+          - theoretical_power
+        lower: 0.0
+        upper: 5.0
+      - columns:
+          - wind_shear_alpha
+        replace_inf_with: 0.0
+        fillna: 0.0
+        lower: -0.5
+        upper: 1.0
